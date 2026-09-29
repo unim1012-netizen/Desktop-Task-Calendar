@@ -418,6 +418,9 @@ final class TaskStore: ObservableObject {
     @Published var newColorIndex: Int
     @Published var themeId: String
     @Published var isDarkMode: Bool
+    // 正在拖拽的任务与把手类型（用于跨行时把手激活色实时跟随新末行/新首行）
+    @Published var draggingTaskID: UUID?
+    @Published var dragKind: String = ""
 
     private let cal = Calendar.widget
 
@@ -558,6 +561,32 @@ final class TaskStore: ObservableObject {
         save()
     }
 
+    /// 实时拖拽：结束日跟随鼠标所在日期（跨行延伸）
+    func setEnd(_ id: UUID, to d: Date) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let s = tasks[i].start ?? d
+        tasks[i].end = d < s ? s : d
+        save()
+    }
+
+    /// 实时拖拽：开始日跟随鼠标所在日期
+    func setStart(_ id: UUID, to d: Date) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let e = tasks[i].end ?? d
+        tasks[i].start = d > e ? e : d
+        save()
+    }
+
+    /// 实时拖拽：整体平移，开始日落在给定日期（保持原跨度）
+    func moveTo(_ id: UUID, startDate d: Date) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }),
+              let s = tasks[i].start, let e = tasks[i].end else { return }
+        let span = cal.daysBetween(s, e)
+        tasks[i].start = d
+        tasks[i].end = cal.addDays(span, to: d)
+        save()
+    }
+
     func unschedule(_ id: UUID) {
         guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
         tasks[i].start = nil
@@ -681,9 +710,15 @@ struct TaskBar: View {
     let isLastRow: Bool    // 任务结束所在行（时间范围、右把手）
     let spansRows: Bool    // 跨多行
     let weekendOverlap: Bool // 覆盖周六/周日（降透明，不变色相）
+    let gridX: CGFloat     // 该条在网格坐标系中的 x（布局位置，供拖拽换算日期）
+    let gridY: CGFloat     // 该条在网格坐标系中的 y
+    let rowH: CGFloat      // 网格行高
 
     @State private var dragMode: DragMode?
     @State private var hovered = false
+    @State private var pressOffsetDays: Int?
+
+    private let cal = Calendar.widget
 
     enum DragMode { case move, resizeStart, resizeEnd }
 
@@ -790,16 +825,19 @@ struct TaskBar: View {
 
     // 拖拽把手：默认 40% 透明度，悬停/按下/拖拽时 100% 并轻微放大 1.1 倍 + 轻阴影
     private func handle(atLeading: Bool, base: Color) -> some View {
-        let isThis = (atLeading && dragMode == .resizeStart) || (!atLeading && dragMode == .resizeEnd)
-        let c = isThis ? store.pal.cAccent : base
+        // 激活态用全局拖拽状态：跨行延伸后，新末行/新首行的把手也能实时高亮
+        let isDraggingThis = store.draggingTaskID == task.id &&
+            ((atLeading && store.dragKind == "resizeStart") || (!atLeading && store.dragKind == "resizeEnd"))
+        let shown = hovered || isDraggingThis
+        let c = isDraggingThis ? store.pal.cAccent : base
         return RoundedRectangle(cornerRadius: 2.5, style: .continuous)
-            .fill(c.opacity((hovered || isThis) ? 1 : 0.4))
+            .fill(c.opacity(shown ? 1 : 0.4))
             .frame(width: 5, height: 10)
-            .scaleEffect((hovered || isThis) ? 1.1 : 1)
-            .shadow(color: (hovered || isThis) ? c.opacity(0.5) : .clear, radius: 3, y: 1)
+            .scaleEffect(shown ? 1.1 : 1)
+            .shadow(color: shown ? c.opacity(0.5) : .clear, radius: 3, y: 1)
             .offset(x: atLeading ? 2.5 : width - 7.5, y: 5)
             .animation(.easeOut(duration: 0.15), value: hovered)
-            .animation(.easeOut(duration: 0.15), value: dragMode != nil)
+            .animation(.easeOut(duration: 0.15), value: isDraggingThis)
             .help(atLeading ? "拖动调整开始日期" : "拖动调整结束日期")
     }
 
@@ -815,6 +853,10 @@ struct TaskBar: View {
     private var drag: some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
+                // 鼠标当前所在网格格子 → 日期（绝对位置驱动，斜向跨行也跟手）
+                let col = min(6, max(0, Int((gridX + value.location.x) / cellWidth)))
+                let row = min(5, max(0, Int((gridY + value.location.y) / rowH)))
+                let date = store.day(at: row * 7 + col)
                 if dragMode == nil {
                     // 左把手只在首行（任务开始处）可调；右把手只在末行（任务结束处）可调
                     if isFirstRow && value.startLocation.x < 12 {
@@ -824,17 +866,28 @@ struct TaskBar: View {
                     } else {
                         dragMode = .move
                     }
+                    if dragMode == .move {
+                        // 记录按下时鼠标日期与任务开始日的偏移，拖动时保持该偏移
+                        pressOffsetDays = cal.daysBetween(task.start ?? date, date)
+                    }
+                    store.draggingTaskID = task.id
+                    store.dragKind = (dragMode == .move) ? "move" : (dragMode == .resizeStart ? "resizeStart" : "resizeEnd")
+                }
+                guard let mode = dragMode else { return }
+                switch mode {
+                case .resizeStart: store.setStart(task.id, to: date)
+                case .resizeEnd: store.setEnd(task.id, to: date)
+                case .move:
+                    if let off = pressOffsetDays {
+                        store.moveTo(task.id, startDate: cal.addDays(-off, to: date))
+                    }
                 }
             }
-            .onEnded { value in
-                defer { dragMode = nil }
-                guard let mode = dragMode else { return }
-                let n = Int((value.translation.width / cellWidth).rounded())
-                switch mode {
-                case .move: store.move(task.id, byDays: n)
-                case .resizeStart: store.resizeStart(task.id, byDays: n)
-                case .resizeEnd: store.resizeEnd(task.id, byDays: n)
-                }
+            .onEnded { _ in
+                dragMode = nil
+                pressOffsetDays = nil
+                store.draggingTaskID = nil
+                store.dragKind = ""
             }
     }
 }
@@ -886,34 +939,37 @@ struct MonthGrid: View {
             let cellW = geo.size.width / 7
             let cellH = geo.size.height / 6
             let barH: CGFloat = 20
-            VStack(spacing: 0) {
-                ForEach(0..<6, id: \.self) { row in
-                    HStack(spacing: 0) {
-                        ForEach(0..<7, id: \.self) { col in
-                            DayCell(day: store.day(at: row * 7 + col))
-                                .frame(width: cellW, height: cellH)
+            ZStack(alignment: .topLeading) {
+                VStack(spacing: 0) {
+                    ForEach(0..<6, id: \.self) { row in
+                        HStack(spacing: 0) {
+                            ForEach(0..<7, id: \.self) { col in
+                                DayCell(day: store.day(at: row * 7 + col))
+                                    .frame(width: cellW, height: cellH)
+                            }
                         }
                     }
-                    .overlay(alignment: .topLeading) {
-                        ZStack(alignment: .topLeading) {
-                            let lanes = store.rowLanes(row)
-                            ForEach(Array(lanes.enumerated()), id: \.offset) { laneIndex, lane in
-                                ForEach(lane) { iv in
-                                    let barW = CGFloat(iv.colEnd - iv.colStart + 1) * cellW - 4
-                                    TaskBar(task: iv.task,
-                                            dayStart: iv.dayStart,
-                                            cellWidth: cellW,
-                                            width: barW,
-                                            isFirstRow: iv.isFirstRow,
-                                            isLastRow: iv.isLastRow,
-                                            spansRows: iv.spansRows,
-                                            weekendOverlap: iv.weekendOverlap)
-                                        .frame(width: barW, height: barH)
-                                        // 预留顶部日期区（22pt），任务条从日期下方开始，避免盖住日期
-                                        .offset(x: CGFloat(iv.colStart) * cellW + 2,
-                                                y: 22 + CGFloat(laneIndex) * (barH + 3))
-                                }
-                            }
+                }
+                // 任务条层：position 定位使布局位置=视觉位置，拖拽坐标可直接换算网格日期
+                ForEach(0..<6, id: \.self) { row in
+                    let lanes = store.rowLanes(row)
+                    ForEach(Array(lanes.enumerated()), id: \.offset) { laneIndex, lane in
+                        ForEach(lane) { iv in
+                            let barW = CGFloat(iv.colEnd - iv.colStart + 1) * cellW - 4
+                            let x = CGFloat(iv.colStart) * cellW + 2
+                            // 预留顶部日期区（22pt），任务条从日期下方开始，避免盖住日期
+                            let y = CGFloat(row) * cellH + 22 + CGFloat(laneIndex) * (barH + 3)
+                            TaskBar(task: iv.task,
+                                    dayStart: iv.dayStart,
+                                    cellWidth: cellW,
+                                    width: barW,
+                                    isFirstRow: iv.isFirstRow,
+                                    isLastRow: iv.isLastRow,
+                                    spansRows: iv.spansRows,
+                                    weekendOverlap: iv.weekendOverlap,
+                                    gridX: x, gridY: y, rowH: cellH)
+                                .frame(width: barW, height: barH)
+                                .position(x: x + barW / 2, y: y + barH / 2)
                         }
                     }
                 }
