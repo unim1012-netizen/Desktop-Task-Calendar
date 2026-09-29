@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-111111?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white)](https://developer.apple.com/xcode/swiftui/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/download-v1.8-blue.svg)](#安装)
+[![Release](https://img.shields.io/badge/download-v1.9-blue.svg)](#安装)
 
 </div>
 
@@ -49,7 +49,7 @@
 | 顶栏月亮 / 太阳 | 切换浅 / 深色模式 |
 | 左上角 | 上 / 下月、「回到今天」 |
 
-跨周任务自动跨行显示，按天吸附对齐。
+跨周任务自动跨行显示（跨行同色连续、行尾渐隐延续、标题只在首行、时间范围在末行）；左右两端有同色系拖拽把手，悬停/拖动高亮放大；拖动实时跟随鼠标所在日期，一次可连续跨多行。
 
 ## 🎨 主题一览
 
@@ -68,7 +68,7 @@
 
 ### 方式一：下载安装包（推荐）
 
-从仓库下载 [`桌面任务日历-v1.8.zip`](桌面任务日历-v1.8.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
+从仓库下载 [`桌面任务日历-v1.9.zip`](桌面任务日历-v1.9.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
 
 > **首次打开提示"无法验证开发者"？**
 > 前往「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行：
@@ -98,7 +98,7 @@ open ../TaskCalendar.app
 │   ├── Info.plist
 │   └── make_icon.swift         # 图标生成脚本
 ├── TaskCalendar.app/           # 预构建好的 App（可直接运行）
-├── 桌面任务日历-v1.8.zip       # 分发包
+├── 桌面任务日历-v1.9.zip       # 分发包
 ├── icon.png                    # 应用图标
 └── README.md
 ```
@@ -122,6 +122,7 @@ open ../TaskCalendar.app
 <details>
 <summary>展开全部版本历史</summary>
 
+- **v1.9**（2026-09-30）：跨行任务连续显示（分段圆角 / 渐隐延续 / 周末降透明）+ 同色系拖拽把手（40%→100% 悬停放大、激活切强调色）+ 绝对位置实时拖拽（任务条跟随鼠标，斜向跨行不断线）。
 - **v1.8**（2026-09-29）：6 套主题整体清透化提亮；「添加」按钮改单色填充；顶栏按钮颜色跟随主题，深色模式下不再隐身。
 - **v1.7**（2026-09-29）：主题系统重构为 6 套高差异化主题，每套含浅 / 深完整语义色；新增明暗切换按钮。
 - **v1.6**（2026-09-29）：加入主题系统，顶栏一键切换并记忆；任务颜色跟随主题标签色板。

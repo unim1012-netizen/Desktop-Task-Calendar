@@ -387,6 +387,24 @@ func taskTextColor(on c: Color) -> Color {
     return lum > 0.62 ? Color(hex: "#20242B") : .white
 }
 
+/// 把颜色调深（× (1-f)），用于浅色模式下把手/连接块比任务条主体深 10%—15%
+func darker(_ c: Color, _ f: CGFloat) -> Color {
+    let ns = NSColor(c).usingColorSpace(.sRGB) ?? NSColor(c)
+    return Color(red: ns.redComponent * (1 - f),
+                 green: ns.greenComponent * (1 - f),
+                 blue: ns.blueComponent * (1 - f),
+                 opacity: ns.alphaComponent)
+}
+
+/// 把颜色调亮（与白色混合 f），用于深色模式下把手/连接线比任务条主体亮一档
+func brighter(_ c: Color, _ f: CGFloat) -> Color {
+    let ns = NSColor(c).usingColorSpace(.sRGB) ?? NSColor(c)
+    return Color(red: ns.redComponent + (1 - ns.redComponent) * f,
+                 green: ns.greenComponent + (1 - ns.greenComponent) * f,
+                 blue: ns.blueComponent + (1 - ns.blueComponent) * f,
+                 opacity: ns.alphaComponent)
+}
+
 /// 旧版（v1.5 及更早）固定莫兰迪任务色板，用于数据迁移映射
 let legacyPalette: [String] = ["#C2A4A2", "#C4B29B", "#A7B29C", "#9CA9B6", "#A79EB8", "#B8A794", "#AB9F87", "#B09DAE"]
 
@@ -448,17 +466,27 @@ final class TaskStore: ObservableObject {
     func rowLanes(_ row: Int) -> [[RowInterval]] {
         let rowStart = day(at: row * 7)
         let rowEnd = day(at: row * 7 + 6)
+        let gridEnd = day(at: 41)
         var intervals: [RowInterval] = []
         for t in scheduled {
             guard let s = t.start, let e = t.end else { continue }
             let cs = max(s, rowStart)
             let ce = min(e, rowEnd)
             guard cs <= ce else { continue }
+            let isFirst = (s >= rowStart && s <= rowEnd) || (s < gridStart && row == 0)
+            let isLast = (e >= rowStart && e <= rowEnd) || (e > gridEnd && row == 5)
+            let spans = !(isFirst && isLast)
+            let colStart = max(0, min(6, cal.daysBetween(gridStart, cs) - row * 7))
+            let colEnd = max(0, min(6, cal.daysBetween(gridStart, ce) - row * 7))
             intervals.append(RowInterval(
                 task: t,
-                colStart: max(0, min(6, cal.daysBetween(gridStart, cs) - row * 7)),
-                colEnd: max(0, min(6, cal.daysBetween(gridStart, ce) - row * 7)),
-                dayStart: cs))
+                colStart: colStart,
+                colEnd: colEnd,
+                dayStart: cs,
+                isFirstRow: isFirst,
+                isLastRow: isLast,
+                spansRows: spans,
+                weekendOverlap: spans && colEnd >= 5))
         }
         intervals.sort { ($0.colStart, -$0.colEnd) < ($1.colStart, -$1.colEnd) }
         var lanes: [[RowInterval]] = []
@@ -593,6 +621,10 @@ struct RowInterval: Identifiable {
     let colStart: Int // 0...6 列
     let colEnd: Int   // 0...6 列（含）
     let dayStart: Date // 该行内实际起始日（作为拖放目标）
+    let isFirstRow: Bool   // 任务开始日所在行（标题在此行显示；左端为开始把手）
+    let isLastRow: Bool    // 任务结束日所在行（时间范围在此行显示；右端为结束把手）
+    let spansRows: Bool    // 任务跨多行显示（跨行任务需要连续圆角/延续符号/连接块）
+    let weekendOverlap: Bool // 该段覆盖周六/周日（跨行任务遇周末降低透明度，不变色相）
 }
 
 // MARK: - 日历格子
@@ -631,7 +663,13 @@ struct DayCell: View {
     }
 }
 
-// MARK: - 日历上的任务条（可拖动：整体平移 / 左缘改开始 / 右缘改结束）
+// MARK: - 日历上的任务条（跨行连续显示 + 拖拽把手：左=开始 / 右=结束 / 中=整体移动）
+
+/// 短日期格式 "M.d"
+func shortDay(_ d: Date) -> String {
+    let c = Calendar.widget
+    return "\(c.component(.month, from: d)).\(c.component(.day, from: d))"
+}
 
 struct TaskBar: View {
     @EnvironmentObject var store: TaskStore
@@ -639,48 +677,149 @@ struct TaskBar: View {
     let dayStart: Date
     let cellWidth: CGFloat
     let width: CGFloat
+    let isFirstRow: Bool   // 任务开始所在行（标题、左把手）
+    let isLastRow: Bool    // 任务结束所在行（时间范围、右把手）
+    let spansRows: Bool    // 跨多行
+    let weekendOverlap: Bool // 覆盖周六/周日（降透明，不变色相）
 
     @State private var dragMode: DragMode?
+    @State private var hovered = false
 
     enum DragMode { case move, resizeStart, resizeEnd }
+
+    // 圆角规则：首行左圆右平、末行右圆左平、中间行两端近平，保持连续感
+    private func barShape(_ pal: ThemePalette) -> UnevenRoundedRectangle {
+        if !spansRows { return UnevenRoundedRectangle(topLeadingRadius: 8, bottomLeadingRadius: 8, bottomTrailingRadius: 8, topTrailingRadius: 8, style: .continuous) }
+        if isFirstRow { return UnevenRoundedRectangle(topLeadingRadius: 8, bottomLeadingRadius: 8, bottomTrailingRadius: 2, topTrailingRadius: 2, style: .continuous) }
+        if isLastRow { return UnevenRoundedRectangle(topLeadingRadius: 2, bottomLeadingRadius: 2, bottomTrailingRadius: 8, topTrailingRadius: 8, style: .continuous) }
+        return UnevenRoundedRectangle(topLeadingRadius: 2, bottomLeadingRadius: 2, bottomTrailingRadius: 2, topTrailingRadius: 2, style: .continuous)
+    }
 
     var body: some View {
         let pal = store.pal
         let col = store.color(of: task)
-        RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(col)
-            .overlay(
-                Text(task.title)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(taskTextColor(on: col))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .padding(.horizontal, 5),
-                alignment: .leading)
-            .shadow(color: pal.isDark ? pal.cAccent.opacity(pal.glowOpacity)
-                                      : Color.black.opacity(0.10),
-                    radius: pal.isDark ? 4 : 2, y: 1)
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .gesture(drag)
-            .contextMenu {
-                Button("移除排期（回到待排列表）") { store.unschedule(task.id) }
-                Divider()
-                Button("删除任务", role: .destructive) { store.removeTask(task.id) }
+        // 跨行任务遇周末：降低一点透明度，但不变色相
+        let barCol = weekendOverlap ? col.opacity(pal.isDark ? 0.90 : 0.82) : col
+        let handleBase = pal.isDark ? brighter(col, 0.30) : darker(col, 0.15)
+        let narrow = width < 34 // 太窄：隐藏文字，只保留把手与色块
+        let showLeftHandle = isFirstRow
+        let showRightHandle = isLastRow
+        let textColor = taskTextColor(on: col)
+
+        return ZStack(alignment: .topLeading) {
+            barShape(pal)
+                .fill(barCol)
+                .shadow(color: pal.isDark ? pal.cAccent.opacity(pal.glowOpacity)
+                                          : Color.black.opacity(0.10),
+                        radius: pal.isDark ? 4 : 2, y: 1)
+
+            // 跨行延续符号：首行右端 / 非首行左端做同色渐隐过渡 + 小圆点
+            if spansRows {
+                if !isLastRow {
+                    LinearGradient(colors: [col.opacity(pal.isDark ? 0.55 : 0.65), col.opacity(0)],
+                                   startPoint: .leading, endPoint: .trailing)
+                        .frame(width: 16)
+                        .offset(x: width - 16, y: 0)
+                    Circle()
+                        .fill(pal.isDark ? brighter(col, 0.45) : col)
+                        .frame(width: 4, height: 4)
+                        .offset(x: width - 4, y: (barHeight - 4) / 2)
+                }
+                if !isFirstRow {
+                    LinearGradient(colors: [col.opacity(0), col.opacity(pal.isDark ? 0.55 : 0.65)],
+                                   startPoint: .leading, endPoint: .trailing)
+                        .frame(width: 16)
+                    Circle()
+                        .fill(pal.isDark ? brighter(col, 0.45) : col)
+                        .frame(width: 4, height: 4)
+                        .offset(x: 0, y: (barHeight - 4) / 2)
+                }
             }
-            .dropDestination(for: String.self) { ids, _ in
-                guard let idStr = ids.first, let id = UUID(uuidString: idStr) else { return false }
-                store.schedule(id, on: dayStart)
-                return true
+
+            // 文字：标题只在首行；时间范围显示在末行；中行不显示文字
+            if !narrow {
+                if isFirstRow {
+                    Text(task.title)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(textColor)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.leading, showLeftHandle ? 13 : 6)
+                        .padding(.trailing, showRightHandle ? 13 : 6)
+                } else if isLastRow && width >= 64 {
+                    Text("\(shortDay(task.start ?? dayStart))–\(shortDay(task.end ?? dayStart))")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(textColor.opacity(0.92))
+                        .lineLimit(1)
+                        .padding(.leading, 6)
+                        .padding(.trailing, showRightHandle ? 13 : 6)
+                }
             }
+
+            // 把手 / 连接块：首行左=开始把手，末行右=结束把手；非首/末端是同色连接块（不可拖拽）
+            if showLeftHandle {
+                handle(atLeading: true, base: handleBase)
+            } else {
+                linkBlock(base: handleBase)
+            }
+            if showRightHandle {
+                handle(atLeading: false, base: handleBase)
+            } else {
+                linkBlock(base: handleBase, trailing: true)
+            }
+        }
+        .frame(width: width, height: barHeight)
+        .contentShape(barShape(pal))
+        .gesture(drag)
+        .onHover { h in
+            withAnimation(.easeOut(duration: 0.15)) { hovered = h }
+        }
+        .contextMenu {
+            Button("移除排期（回到待排列表）") { store.unschedule(task.id) }
+            Divider()
+            Button("删除任务", role: .destructive) { store.removeTask(task.id) }
+        }
+        .dropDestination(for: String.self) { ids, _ in
+            guard let idStr = ids.first, let id = UUID(uuidString: idStr) else { return false }
+            store.schedule(id, on: dayStart)
+            return true
+        }
+    }
+
+    private var barHeight: CGFloat { 20 }
+
+    // 拖拽把手：默认 40% 透明度，悬停/按下/拖拽时 100% 并轻微放大 1.1 倍 + 轻阴影
+    private func handle(atLeading: Bool, base: Color) -> some View {
+        let isThis = (atLeading && dragMode == .resizeStart) || (!atLeading && dragMode == .resizeEnd)
+        let c = isThis ? store.pal.cAccent : base
+        return RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+            .fill(c.opacity((hovered || isThis) ? 1 : 0.4))
+            .frame(width: 5, height: 10)
+            .scaleEffect((hovered || isThis) ? 1.1 : 1)
+            .shadow(color: (hovered || isThis) ? c.opacity(0.5) : .clear, radius: 3, y: 1)
+            .offset(x: atLeading ? 2.5 : width - 7.5, y: 5)
+            .animation(.easeOut(duration: 0.15), value: hovered)
+            .animation(.easeOut(duration: 0.15), value: dragMode != nil)
+            .help(atLeading ? "拖动调整开始日期" : "拖动调整结束日期")
+    }
+
+    // 中行连接块：同色小方块、低透明度、不可拖拽，避免误操作
+    private func linkBlock(base: Color, trailing: Bool = false) -> some View {
+        let pal = store.pal
+        return RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+            .fill(base.opacity(pal.isDark ? 0.45 : 0.30))
+            .frame(width: 5, height: 10)
+            .offset(x: trailing ? width - 7.5 : 2.5, y: 5)
     }
 
     private var drag: some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
                 if dragMode == nil {
-                    if value.startLocation.x < width * 0.22 {
+                    // 左把手只在首行（任务开始处）可调；右把手只在末行（任务结束处）可调
+                    if isFirstRow && value.startLocation.x < 12 {
                         dragMode = .resizeStart
-                    } else if value.startLocation.x > width * 0.78 {
+                    } else if isLastRow && value.startLocation.x > width - 12 {
                         dragMode = .resizeEnd
                     } else {
                         dragMode = .move
@@ -764,7 +903,11 @@ struct MonthGrid: View {
                                     TaskBar(task: iv.task,
                                             dayStart: iv.dayStart,
                                             cellWidth: cellW,
-                                            width: barW)
+                                            width: barW,
+                                            isFirstRow: iv.isFirstRow,
+                                            isLastRow: iv.isLastRow,
+                                            spansRows: iv.spansRows,
+                                            weekendOverlap: iv.weekendOverlap)
                                         .frame(width: barW, height: barH)
                                         // 预留顶部日期区（22pt），任务条从日期下方开始，避免盖住日期
                                         .offset(x: CGFloat(iv.colStart) * cellW + 2,
