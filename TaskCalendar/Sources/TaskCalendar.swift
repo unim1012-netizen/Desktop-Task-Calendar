@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreGraphics
 
 // MARK: - 日历工具（周一为一周第一天）
 
@@ -380,11 +381,23 @@ struct Theme: Identifiable {
     ]
 }
 
-/// 任务条文字颜色：按底色亮度自适应（浅色任务条用深字，深色任务条用白字）
-func taskTextColor(on c: Color) -> Color {
-    let ns = NSColor(c).usingColorSpace(.sRGB) ?? NSColor(c)
-    let lum = 0.2126 * ns.redComponent + 0.7152 * ns.greenComponent + 0.0722 * ns.blueComponent
-    return lum > 0.62 ? Color(hex: "#20242B") : .white
+/// 任务条文字颜色：优先使用主题品牌对比色（buttonText，即各主题规范指定的任务条文字色：
+/// 薄荷=深可可、柠檬=深墨绿、可可=奶油白、蜜桃=深桃褐、海盐=奶油白、抹茶=奶白），
+/// 与任务条底色对比度充足时直接采用，保证同屏任务条文字统一、跟随主题；
+/// 对比度不足时按底色亮度自动切换为主题语义深/浅色，确保任何模式下都可读
+func taskTextColor(on c: Color, pal: ThemePalette) -> Color {
+    let bg = NSColor(c).usingColorSpace(.sRGB) ?? NSColor(c)
+    let lum = 0.2126 * bg.redComponent + 0.7152 * bg.greenComponent + 0.0722 * bg.blueComponent
+    let bt = NSColor(pal.cButtonText).usingColorSpace(.sRGB) ?? NSColor(pal.cButtonText)
+    let btLum = 0.2126 * bt.redComponent + 0.7152 * bt.greenComponent + 0.0722 * bt.blueComponent
+    // 对比度足够：直接用主题品牌对比色（最协调、最“主题化”）
+    if abs(btLum - lum) >= 0.30 { return pal.cButtonText }
+    // 对比不足：亮底需要深字（浅色模式用一级深色文字；深色模式用主按钮深色或反白深色）
+    if lum > 0.5 {
+        return pal.isDark ? (btLum > 0.5 ? pal.cTextInverse : pal.cButtonText) : pal.cTextPrimary
+    }
+    // 暗底需要浅字（深色模式用一级浅色文字；浅色模式用反白浅色文字）
+    return pal.isDark ? pal.cTextPrimary : pal.cTextInverse
 }
 
 /// 把颜色调深（× (1-f)），用于浅色模式下把手/连接块比任务条主体深 10%—15%
@@ -405,6 +418,24 @@ func brighter(_ c: Color, _ f: CGFloat) -> Color {
                  opacity: ns.alphaComponent)
 }
 
+/// 按比例混合两个颜色（f 为 b 的占比）：用于把任务条标签色与主题卡片背景轻微混合，降低纯度、更融入主题
+func mix(_ a: Color, _ b: Color, _ f: CGFloat) -> Color {
+    let na = NSColor(a).usingColorSpace(.sRGB) ?? NSColor(a)
+    let nb = NSColor(b).usingColorSpace(.sRGB) ?? NSColor(b)
+    return Color(red: na.redComponent * (1 - f) + nb.redComponent * f,
+                 green: na.greenComponent * (1 - f) + nb.greenComponent * f,
+                 blue: na.blueComponent * (1 - f) + nb.blueComponent * f,
+                 opacity: na.alphaComponent)
+}
+
+/// 任务条高度：标题在整行宽度下放不下时加高为两行（同一任务跨行各行高度一致，按整行宽统一判断）
+func taskBarHeight(title: String, fullRowW: CGFloat, base: CGFloat) -> CGFloat {
+    let avail = max(60, fullRowW - 26)
+    let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+    let w = (title as NSString).size(withAttributes: [.font: font]).width
+    return w > avail ? max(base, 34) : base
+}
+
 /// 旧版（v1.5 及更早）固定莫兰迪任务色板，用于数据迁移映射
 let legacyPalette: [String] = ["#C2A4A2", "#C4B29B", "#A7B29C", "#9CA9B6", "#A79EB8", "#B8A794", "#AB9F87", "#B09DAE"]
 
@@ -421,6 +452,8 @@ final class TaskStore: ObservableObject {
     // 正在拖拽的任务与把手类型（用于跨行时把手激活色实时跟随新末行/新首行）
     @Published var draggingTaskID: UUID?
     @Published var dragKind: String = ""
+    // 窗口是否固定到桌面层（桌面 pin：窗口钉在桌面壁纸之上、其他窗口之下）
+    @Published var pinnedToDesktop = false
 
     private let cal = Calendar.widget
 
@@ -514,7 +547,7 @@ final class TaskStore: ObservableObject {
                               colorIndex: idx,
                               start: nil, end: nil))
         newTitle = ""
-        newColorIndex = (idx + 1) % pal.tagPalette.count
+        // 保持当前所选颜色不变，由用户手动切换（不再自动跳到下一个颜色）
         save()
     }
 
@@ -606,6 +639,23 @@ final class TaskStore: ObservableObject {
         displayedMonth = cal.startOfMonth(Date())
     }
 
+    /// 固定/取消固定到桌面：保持普通窗口层级（交互完全正常），窗口在所有桌面空间跟随显示、位置固定。
+    /// 注：壁纸层（desktop level）窗口在 macOS 上无法接收输入，会导致整个界面失效，故不使用
+    func toggleDesktopPin() {
+        pinnedToDesktop.toggle()
+        guard let w = NSApp.windows.first else { return }
+        if pinnedToDesktop {
+            // 钉在桌面：普通层级 + 所有空间跟随 + 位置固定
+            w.level = .normal
+            w.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        } else {
+            w.level = .normal
+            w.collectionBehavior = []
+        }
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     // MARK: 持久化
 
     private var fileURL: URL {
@@ -661,6 +711,7 @@ struct RowInterval: Identifiable {
 struct DayCell: View {
     @EnvironmentObject var store: TaskStore
     let day: Date
+    var compact: Bool = false // 窗口较小时缩小日期数字与留白，适配更小尺寸
 
     var body: some View {
         let cal = Calendar.widget
@@ -677,11 +728,11 @@ struct DayCell: View {
                               lineWidth: 1))
             .overlay(alignment: .topLeading) {
                 Text("\(cal.component(.day, from: day))")
-                    .font(.system(size: 11, weight: isToday ? .semibold : .regular))
+                    .font(.system(size: compact ? 10 : 11, weight: isToday ? .semibold : .regular))
                     .foregroundColor(isToday ? pal.cAccent
                                              : (inMonth ? pal.cTextPrimary : pal.cTextTertiary))
-                    .padding(.leading, 6)
-                    .padding(.top, 4)
+                    .padding(.leading, compact ? 5 : 6)
+                    .padding(.top, compact ? 2 : 4)
             }
             .contentShape(RoundedRectangle(cornerRadius: theme.cornerRadius, style: .continuous))
             .dropDestination(for: String.self) { ids, _ in
@@ -689,6 +740,25 @@ struct DayCell: View {
                 store.schedule(id, on: day)
                 return true
             }
+    }
+}
+
+// MARK: - 任务条拖放目标（待办胶囊拖到任务条上：按鼠标落点精确换算日期，支持同一日期排多个任务）
+
+struct BarDropDelegate: DropDelegate {
+    let store: TaskStore
+    let id: UUID
+    let gridX: CGFloat
+    let gridY: CGFloat
+    let cellWidth: CGFloat
+    let rowH: CGFloat
+
+    func performDrop(info: DropInfo) -> Bool {
+        let p = info.location
+        let col = min(6, max(0, Int((gridX + p.x) / cellWidth)))
+        let row = min(5, max(0, Int((gridY + p.y) / rowH)))
+        store.schedule(id, on: store.day(at: row * 7 + col))
+        return true
     }
 }
 
@@ -713,6 +783,7 @@ struct TaskBar: View {
     let gridX: CGFloat     // 该条在网格坐标系中的 x（布局位置，供拖拽换算日期）
     let gridY: CGFloat     // 该条在网格坐标系中的 y
     let rowH: CGFloat      // 网格行高
+    let barHeight: CGFloat // 任务条高度（随泳道数动态适配）
 
     @State private var dragMode: DragMode?
     @State private var hovered = false
@@ -733,17 +804,24 @@ struct TaskBar: View {
     var body: some View {
         let pal = store.pal
         let col = store.color(of: task)
+        // 浅色模式：标签色与卡片背景轻微混合（保持明快）；深色模式：明显压暗降纯（与深色主题融合，不刺眼）
+        let baseCol = pal.isDark ? mix(col, pal.cCardBackground, 0.45) : mix(col, pal.cCardBackground, 0.10)
         // 跨行任务遇周末：降低一点透明度，但不变色相
-        let barCol = weekendOverlap ? col.opacity(pal.isDark ? 0.90 : 0.82) : col
-        let handleBase = pal.isDark ? brighter(col, 0.30) : darker(col, 0.15)
+        let barCol = weekendOverlap ? baseCol.opacity(pal.isDark ? 0.90 : 0.82) : baseCol
+        let handleBase = pal.isDark ? brighter(baseCol, 0.30) : darker(baseCol, 0.15)
         let narrow = width < 34 // 太窄：隐藏文字，只保留把手与色块
         let showLeftHandle = isFirstRow
         let showRightHandle = isLastRow
-        let textColor = taskTextColor(on: col)
+        // 文字颜色：深色模式统一用主题一级浅色文字（带主题色相，暗底浅字可读且协调）；
+        // 浅色模式按亮度适配（优先品牌对比色，对比不足兜底）
+        let textColor = pal.isDark ? pal.cTextPrimary : taskTextColor(on: baseCol, pal: pal)
 
         return ZStack(alignment: .topLeading) {
             barShape(pal)
                 .fill(barCol)
+                // 同色系细描边：提升任务条精致度（颜色仍跟随主题）
+                .overlay(barShape(pal)
+                    .strokeBorder(baseCol.opacity(pal.isDark ? 0.45 : 0.35), lineWidth: 1))
                 .shadow(color: pal.isDark ? pal.cAccent.opacity(pal.glowOpacity)
                                           : Color.black.opacity(0.10),
                         radius: pal.isDark ? 4 : 2, y: 1)
@@ -751,43 +829,53 @@ struct TaskBar: View {
             // 跨行延续符号：首行右端 / 非首行左端做同色渐隐过渡 + 小圆点
             if spansRows {
                 if !isLastRow {
-                    LinearGradient(colors: [col.opacity(pal.isDark ? 0.55 : 0.65), col.opacity(0)],
+                    LinearGradient(colors: [baseCol.opacity(pal.isDark ? 0.55 : 0.65), baseCol.opacity(0)],
                                    startPoint: .leading, endPoint: .trailing)
                         .frame(width: 16)
                         .offset(x: width - 16, y: 0)
                     Circle()
-                        .fill(pal.isDark ? brighter(col, 0.45) : col)
+                        .fill(pal.isDark ? brighter(baseCol, 0.45) : baseCol)
                         .frame(width: 4, height: 4)
                         .offset(x: width - 4, y: (barHeight - 4) / 2)
                 }
                 if !isFirstRow {
-                    LinearGradient(colors: [col.opacity(0), col.opacity(pal.isDark ? 0.55 : 0.65)],
+                    LinearGradient(colors: [baseCol.opacity(0), baseCol.opacity(pal.isDark ? 0.55 : 0.65)],
                                    startPoint: .leading, endPoint: .trailing)
                         .frame(width: 16)
                     Circle()
-                        .fill(pal.isDark ? brighter(col, 0.45) : col)
+                        .fill(pal.isDark ? brighter(baseCol, 0.45) : baseCol)
                         .frame(width: 4, height: 4)
                         .offset(x: 0, y: (barHeight - 4) / 2)
                 }
             }
 
-            // 文字：标题只在首行；时间范围显示在末行；中行不显示文字
+            // 文字：跨行任务的末行显示时间范围；首行、中间行以及单格任务（首行=末行）都显示任务名称。
+            // 字距随任务条宽度适度延长（有上限，不会拉爆）；文字垂直居中
             if !narrow {
-                if isFirstRow {
-                    Text(task.title)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(textColor)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .padding(.leading, showLeftHandle ? 13 : 6)
-                        .padding(.trailing, showRightHandle ? 13 : 6)
-                } else if isLastRow && width >= 64 {
+                if isLastRow && !isFirstRow && width >= 64 {
                     Text("\(shortDay(task.start ?? dayStart))–\(shortDay(task.end ?? dayStart))")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(textColor.opacity(0.92))
+                        .font(.system(size: 8.5, weight: .medium, design: .rounded))
+                        .foregroundColor(textColor.opacity(0.88))
+                        .kerning(0.1)
                         .lineLimit(1)
                         .padding(.leading, 6)
                         .padding(.trailing, showRightHandle ? 13 : 6)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                } else {
+                    // 字距随条宽延长：宽任务条（跨多天）字距舒展开，封顶 9pt，避免拉爆；
+                    // 长名称自动换行（最多 2 行，配合任务条加高），不再用“…”截断
+                    let tracking = min(9.0, max(0.0, (width - 90) / 40))
+                    Text(task.title)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundColor(textColor)
+                        .kerning(0.3)
+                        .tracking(tracking)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
+                        .truncationMode(.tail)
+                        .padding(.leading, showLeftHandle ? 13 : 6)
+                        .padding(.trailing, showRightHandle ? 13 : 6)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
             }
 
@@ -814,14 +902,11 @@ struct TaskBar: View {
             Divider()
             Button("删除任务", role: .destructive) { store.removeTask(task.id) }
         }
-        .dropDestination(for: String.self) { ids, _ in
-            guard let idStr = ids.first, let id = UUID(uuidString: idStr) else { return false }
-            store.schedule(id, on: dayStart)
-            return true
-        }
+        .onDrop(of: [.plainText],
+                delegate: BarDropDelegate(store: store, id: task.id,
+                                          gridX: gridX, gridY: gridY,
+                                          cellWidth: cellWidth, rowH: rowH))
     }
-
-    private var barHeight: CGFloat { 20 }
 
     // 拖拽把手：默认 40% 透明度，悬停/按下/拖拽时 100% 并轻微放大 1.1 倍 + 轻阴影
     private func handle(atLeading: Bool, base: Color) -> some View {
@@ -835,7 +920,7 @@ struct TaskBar: View {
             .frame(width: 5, height: 10)
             .scaleEffect(shown ? 1.1 : 1)
             .shadow(color: shown ? c.opacity(0.5) : .clear, radius: 3, y: 1)
-            .offset(x: atLeading ? 2.5 : width - 7.5, y: 5)
+            .offset(x: atLeading ? 2.5 : width - 7.5, y: (barHeight - 10) / 2)
             .animation(.easeOut(duration: 0.15), value: hovered)
             .animation(.easeOut(duration: 0.15), value: isDraggingThis)
             .help(atLeading ? "拖动调整开始日期" : "拖动调整结束日期")
@@ -847,7 +932,7 @@ struct TaskBar: View {
         return RoundedRectangle(cornerRadius: 2.5, style: .continuous)
             .fill(base.opacity(pal.isDark ? 0.45 : 0.30))
             .frame(width: 5, height: 10)
-            .offset(x: trailing ? width - 7.5 : 2.5, y: 5)
+            .offset(x: trailing ? width - 7.5 : 2.5, y: (barHeight - 10) / 2)
     }
 
     private var drag: some Gesture {
@@ -931,6 +1016,13 @@ struct TaskChip: View {
 
 // MARK: - 月历网格
 
+/// 一个泳道的预排布局：任务条集合 + 起始 y + 泳道高度（按标题换行需求自适应）
+struct LaneLayout {
+    let items: [RowInterval]
+    let y: CGFloat
+    let h: CGFloat
+}
+
 struct MonthGrid: View {
     @EnvironmentObject var store: TaskStore
 
@@ -938,13 +1030,32 @@ struct MonthGrid: View {
         GeometryReader { geo in
             let cellW = geo.size.width / 7
             let cellH = geo.size.height / 6
-            let barH: CGFloat = 20
+            // 行内泳道数决定任务条基础高度：重叠/交叉任务越多，条越紧凑，保证都能堆叠显示且不溢出
+            let maxLanes = max(1, (0..<6).map { store.rowLanes($0).count }.max() ?? 1)
+            let barH = min(24, max(14, (cellH - 32) / CGFloat(maxLanes) - 2))
+            // 顶部日期区：窗口变矮时按比例压缩（最小 14），任务条从日期下方开始，不盖日期
+            let topPad = min(22, max(14, cellH * 0.30))
+            let compactCell = cellH < 50
+            // 预计算每行泳道布局：条高随标题是否换行自适应，泳道按累计高度排布互不重叠
+            let rowLayouts: [[LaneLayout]] = (0..<6).map { row in
+                let lanes = store.rowLanes(row)
+                var result: [LaneLayout] = []
+                var curY: CGFloat = topPad
+                for lane in lanes {
+                    let laneH = lane
+                        .map { taskBarHeight(title: $0.task.title, fullRowW: geo.size.width, base: barH) }
+                        .max() ?? barH
+                    result.append(LaneLayout(items: lane, y: curY, h: laneH))
+                    curY += laneH + 3
+                }
+                return result
+            }
             ZStack(alignment: .topLeading) {
                 VStack(spacing: 0) {
                     ForEach(0..<6, id: \.self) { row in
                         HStack(spacing: 0) {
                             ForEach(0..<7, id: \.self) { col in
-                                DayCell(day: store.day(at: row * 7 + col))
+                                DayCell(day: store.day(at: row * 7 + col), compact: compactCell)
                                     .frame(width: cellW, height: cellH)
                             }
                         }
@@ -952,13 +1063,11 @@ struct MonthGrid: View {
                 }
                 // 任务条层：position 定位使布局位置=视觉位置，拖拽坐标可直接换算网格日期
                 ForEach(0..<6, id: \.self) { row in
-                    let lanes = store.rowLanes(row)
-                    ForEach(Array(lanes.enumerated()), id: \.offset) { laneIndex, lane in
-                        ForEach(lane) { iv in
+                    ForEach(Array(rowLayouts[row].enumerated()), id: \.offset) { _, layout in
+                        ForEach(layout.items) { iv in
                             let barW = CGFloat(iv.colEnd - iv.colStart + 1) * cellW - 4
                             let x = CGFloat(iv.colStart) * cellW + 2
-                            // 预留顶部日期区（22pt），任务条从日期下方开始，避免盖住日期
-                            let y = CGFloat(row) * cellH + 22 + CGFloat(laneIndex) * (barH + 3)
+                            let y = CGFloat(row) * cellH + layout.y
                             TaskBar(task: iv.task,
                                     dayStart: iv.dayStart,
                                     cellWidth: cellW,
@@ -967,9 +1076,10 @@ struct MonthGrid: View {
                                     isLastRow: iv.isLastRow,
                                     spansRows: iv.spansRows,
                                     weekendOverlap: iv.weekendOverlap,
-                                    gridX: x, gridY: y, rowH: cellH)
-                                .frame(width: barW, height: barH)
-                                .position(x: x + barW / 2, y: y + barH / 2)
+                                    gridX: x, gridY: y, rowH: cellH,
+                                    barHeight: layout.h)
+                                .frame(width: barW, height: layout.h)
+                                .position(x: x + barW / 2, y: y + layout.h / 2)
                         }
                     }
                 }
@@ -994,7 +1104,7 @@ struct ContentView: View {
         }
         .padding(14)
         .background(store.pal.cPageBackground)
-        .frame(minWidth: 820, minHeight: 560)
+        .frame(minWidth: 520, minHeight: 440)
     }
 
     private var header: some View {
@@ -1021,6 +1131,10 @@ struct ContentView: View {
                 .background(Capsule().fill(pal.cTextPrimary.opacity(0.05)))
                 .overlay(Capsule().strokeBorder(pal.cTextPrimary.opacity(0.14), lineWidth: 1))
             Spacer()
+            iconButton(icon: store.pinnedToDesktop ? "pin.fill" : "pin",
+                       help: store.pinnedToDesktop ? "取消固定到桌面" : "固定到桌面（窗口钉在桌面层，壁纸之上、普通窗口之下，跨空间跟随）") {
+                store.toggleDesktopPin()
+            }
             iconButton(icon: pal.isDark ? "sun.max" : "moon",
                        help: pal.isDark ? "切换浅色模式" : "切换深色模式") { store.toggleDarkMode() }
             themeMenu
@@ -1219,5 +1333,14 @@ struct DesktopTaskCalendarApp: App {
                 .environmentObject(store)
         }
         .defaultSize(width: 980, height: 640)
+        .commands {
+            // 菜单栏命令：固定/取消固定到桌面（Cmd+P）——即使顶栏按钮被其他窗口遮挡，也能从菜单栏随时切换
+            CommandMenu("窗口") {
+                Button(store.pinnedToDesktop ? "取消固定到桌面" : "固定到桌面") {
+                    store.toggleDesktopPin()
+                }
+                .keyboardShortcut("p", modifiers: .command)
+            }
+        }
     }
 }
