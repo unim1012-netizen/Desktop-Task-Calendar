@@ -68,6 +68,9 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var colorIndex: Int?   // 主题标签色板中的位置（旧数据为 nil 时回退用 colorHex）
     var start: Date?   // 排期开始日（未排期时为 nil）
     var end: Date?     // 排期结束日
+    var done: Bool? = nil          // 已完成（粒子消散后置位，渲染时隐藏）
+    var repeatRule: String? = nil  // 重复规则：nil / "daily" / "weekly" / "monthly"
+    var isDerived: Bool? = nil     // 重复任务展开出的派生实例（只读，不可拖拽/完成）
     var isScheduled: Bool { start != nil && end != nil }
 }
 
@@ -447,6 +450,7 @@ final class TaskStore: ObservableObject {
     @Published var displayedMonth: Date
     @Published var newTitle: String = ""
     @Published var newColorIndex: Int
+    @Published var newRepeatRule: String? = nil  // 待添加任务的重复规则
     @Published var themeId: String
     @Published var isDarkMode: Bool
     // 正在拖拽的任务与把手类型（用于跨行时把手激活色实时跟随新末行/新首行）
@@ -491,6 +495,62 @@ final class TaskStore: ObservableObject {
     var unscheduled: [TaskItem] { tasks.filter { !$0.isScheduled } }
     var scheduled: [TaskItem] { tasks.filter { $0.isScheduled } }
 
+    /// 渲染用任务列表：未完成的主任务 + 重复规则在视图月内展开的派生实例（单日只读副本）
+    var visibleScheduled: [TaskItem] {
+        var out: [TaskItem] = []
+        let gridEnd = day(at: 41)
+        for t in scheduled where t.done != true {
+            out.append(t)
+            guard let rule = t.repeatRule, let s = t.start else { continue }
+            var d = cal.addDays(1, to: s)
+            while d <= gridEnd {
+                if matchesRepeat(rule, origin: s, day: d) {
+                    out.append(TaskItem(id: UUID(), title: t.title, colorHex: t.colorHex,
+                                        colorIndex: t.colorIndex, start: d, end: d,
+                                        done: false, repeatRule: nil, isDerived: true))
+                }
+                d = cal.addDays(1, to: d)
+            }
+        }
+        return out
+    }
+
+    /// 重复规则命中判断：每天 / 每周同日 / 每月同日
+    func matchesRepeat(_ rule: String, origin: Date, day: Date) -> Bool {
+        switch rule {
+        case "daily": return true
+        case "weekly": return cal.component(.weekday, from: day) == cal.component(.weekday, from: origin)
+        case "monthly": return cal.component(.day, from: day) == cal.component(.day, from: origin)
+        default: return false
+        }
+    }
+
+    /// 点击切换待添加任务的重复规则：不重复 → 每天 → 每周 → 每月
+    func toggleRepeat() {
+        switch newRepeatRule {
+        case nil: newRepeatRule = "daily"
+        case "daily": newRepeatRule = "weekly"
+        case "weekly": newRepeatRule = "monthly"
+        default: newRepeatRule = nil
+        }
+    }
+
+    var repeatLabel: String {
+        switch newRepeatRule {
+        case "daily": return "每天"
+        case "weekly": return "每周"
+        case "monthly": return "每月"
+        default: return "不重复"
+        }
+    }
+
+    /// 标记完成：任务以粒子消散后置位，从日历视图中隐藏
+    func complete(_ id: UUID) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        tasks[i].done = true
+        save()
+    }
+
     var gridStart: Date { cal.gridStart(ofMonth: displayedMonth) }
     var monthTitle: String { cal.monthTitle(displayedMonth) }
     var yearTitle: String { cal.yearOnly(displayedMonth) }
@@ -504,7 +564,7 @@ final class TaskStore: ObservableObject {
         let rowEnd = day(at: row * 7 + 6)
         let gridEnd = day(at: 41)
         var intervals: [RowInterval] = []
-        for t in scheduled {
+        for t in visibleScheduled {
             guard let s = t.start, let e = t.end else { continue }
             let cs = max(s, rowStart)
             let ce = min(e, rowEnd)
@@ -545,7 +605,8 @@ final class TaskStore: ObservableObject {
         tasks.append(TaskItem(id: UUID(), title: t,
                               colorHex: pal.tagPalette[idx],
                               colorIndex: idx,
-                              start: nil, end: nil))
+                              start: nil, end: nil,
+                              done: false, repeatRule: newRepeatRule, isDerived: nil))
         newTitle = ""
         // 保持当前所选颜色不变，由用户手动切换（不再自动跳到下一个颜色）
         save()
@@ -788,6 +849,7 @@ struct TaskBar: View {
     @State private var dragMode: DragMode?
     @State private var hovered = false
     @State private var pressOffsetDays: Int?
+    @State private var showingBurst = false   // 完成粒子消散动画进行中
 
     private let cal = Calendar.widget
 
@@ -890,6 +952,31 @@ struct TaskBar: View {
             } else {
                 linkBlock(base: handleBase, trailing: true)
             }
+
+            // 完成按钮（仅主任务首行显示，避开左右把手）：点击后任务条粒子消散，标记完成
+            if isFirstRow && task.isDerived != true && width >= 48 {
+                ZStack {
+                    Circle().fill(barCol).frame(width: 13, height: 13)
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(textColor)
+                }
+                .overlay(Circle().strokeBorder(textColor.opacity(0.65), lineWidth: 1.2))
+                .opacity(hovered ? 1 : 0.85)
+                .scaleEffect(hovered ? 1.08 : 1)
+                .contentShape(Circle())
+                .highPriorityGesture(TapGesture().onEnded {
+                    withAnimation(.easeOut(duration: 0.15)) { showingBurst = true }
+                })
+                .help("标记完成（粒子消散）")
+                .offset(x: width - 26, y: (barHeight - 13) / 2)
+            }
+        }
+        .overlay {
+            if showingBurst {
+                ParticleBurst(color: barCol) { store.complete(task.id) }
+                    .offset(x: width / 2, y: barHeight / 2)
+            }
         }
         .frame(width: width, height: barHeight)
         .contentShape(barShape(pal))
@@ -906,6 +993,50 @@ struct TaskBar: View {
                 delegate: BarDropDelegate(store: store, id: task.id,
                                           gridX: gridX, gridY: gridY,
                                           cellWidth: cellWidth, rowH: rowH))
+    }
+
+    /// 完成动画：48 个大颗粒从任务条中心向四周爆发，伴随冲击波圆环与中心闪光，更明显的消散效果
+    private struct ParticleBurst: View {
+        let color: Color
+        let onDone: () -> Void
+        @State private var exploded = false
+
+        var body: some View {
+            ZStack {
+                // 冲击波圆环：从任务条中心向外扩散并淡出
+                Circle()
+                    .stroke(color, lineWidth: 2.5)
+                    .frame(width: 110, height: 110)
+                    .scaleEffect(exploded ? 1 : 0.04)
+                    .opacity(exploded ? 0 : 0.95)
+                // 中心闪光：短暂放大后消失
+                Image(systemName: "sparkles")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(color)
+                    .scaleEffect(exploded ? 1.6 : 0.5)
+                    .opacity(exploded ? 0 : 1)
+                // 48 颗粒子：大尺寸、远距离飞散
+                ForEach(0..<48, id: \.self) { i in
+                    Circle()
+                        .fill(color)
+                        .frame(width: CGFloat(3 + i % 5), height: CGFloat(3 + i % 5))
+                        .offset(exploded ? ParticleBurst.burstOffset(i) : .zero)
+                        .opacity(exploded ? 0 : 1)
+                }
+            }
+            .allowsHitTesting(false)
+            .onAppear {
+                withAnimation(.easeOut(duration: 0.65)) { exploded = true }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { onDone() }
+            }
+        }
+
+        /// 不均匀角度 + 长短距混合，飞散范围更大更自然
+        static func burstOffset(_ i: Int) -> CGSize {
+            let a = Double(i) / 48 * 2 * .pi + Double(i % 3) * 0.35
+            let d = CGFloat(26 + (i % 9) * 16)   // 26 → 154pt
+            return CGSize(width: cos(a) * d, height: sin(a) * d)
+        }
     }
 
     // 拖拽把手：默认 40% 透明度，悬停/按下/拖拽时 100% 并轻微放大 1.1 倍 + 轻阴影
@@ -938,6 +1069,8 @@ struct TaskBar: View {
     private var drag: some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
+                // 重复任务派生实例只读：可响应手势但不产生任何数据变化
+                guard task.isDerived != true else { return }
                 // 鼠标当前所在网格格子 → 日期（绝对位置驱动，斜向跨行也跟手）
                 let col = min(6, max(0, Int((gridX + value.location.x) / cellWidth)))
                 let row = min(5, max(0, Int((gridY + value.location.y) / rowH)))
@@ -1252,6 +1385,25 @@ struct ContentView: View {
                     .help("选择任务颜色")
                 }
             }
+            Button {
+                store.toggleRepeat()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(store.repeatLabel)
+                        .font(.system(size: 11))
+                }
+                .foregroundColor(pal.cTextSecondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(pal.cTextSecondary.opacity(0.08)))
+                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(pal.cTextSecondary.opacity(0.15), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .help("重复规则：点击循环切换（不重复 → 每天 → 每周 → 每月）")
             Button("添加") { store.addTask() }
                 .buttonStyle(.plain)
                 .font(.system(size: 13, weight: .semibold))
