@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CoreGraphics
+import Network
 
 // MARK: - 日历工具（周一为一周第一天）
 
@@ -68,9 +69,13 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var colorIndex: Int?   // 主题标签色板中的位置（旧数据为 nil 时回退用 colorHex）
     var start: Date?   // 排期开始日（未排期时为 nil）
     var end: Date?     // 排期结束日
-    var done: Bool? = nil          // 已完成（粒子消散后置位，渲染时隐藏）
+    var done: Bool? = nil          // 主任务整体完成（渲染为留痕淡化）
     var repeatRule: String? = nil  // 重复规则：nil / "daily" / "weekly" / "monthly"
     var isDerived: Bool? = nil     // 重复任务展开出的派生实例（只读，不可拖拽/完成）
+    var completedDates: [String]? = nil  // 重复任务按日期逐个完成的记录（ISO8601 日期字符串）
+    var syncToNative: Bool? = nil        // 单任务同步开关（同步到原生日历/提醒）
+    var syncReminderID: String? = nil    // 已同步的提醒事项 ID（幂等更新用）
+    var syncEventID: String? = nil       // 已同步的日历事件 ID（幂等更新用）
     var isScheduled: Bool { start != nil && end != nil }
 }
 
@@ -446,42 +451,112 @@ let legacyPalette: [String] = ["#C2A4A2", "#C4B29B", "#A7B29C", "#9CA9B6", "#A79
 
 @MainActor
 final class TaskStore: ObservableObject {
-    @Published var tasks: [TaskItem] = []
-    @Published var displayedMonth: Date
-    @Published var newTitle: String = ""
-    @Published var newColorIndex: Int
-    @Published var newRepeatRule: String? = nil  // 待添加任务的重复规则
-    @Published var themeId: String
-    @Published var isDarkMode: Bool
+    // @Published 等价实现（不依赖宏编译器；每次写入发送 objectWillChange 通知）
+    private var _tasks: [TaskItem] = [] { didSet { objectWillChange.send() } }
+    var tasks: [TaskItem] {
+        get { _tasks }
+        set { _tasks = newValue }
+    }
+    private var _displayedMonth: Date = Date() { didSet { objectWillChange.send() } }
+    var displayedMonth: Date {
+        get { _displayedMonth }
+        set { _displayedMonth = newValue }
+    }
+    private var _newTitle: String = "" { didSet { objectWillChange.send() } }
+    var newTitle: String {
+        get { _newTitle }
+        set { _newTitle = newValue }
+    }
+    private var _newColorIndex: Int = 0 { didSet { objectWillChange.send() } }
+    var newColorIndex: Int {
+        get { _newColorIndex }
+        set { _newColorIndex = newValue }
+    }
+    private var _newRepeatRule: String? = nil { didSet { objectWillChange.send() } }
+    var newRepeatRule: String? {
+        get { _newRepeatRule }
+        set { _newRepeatRule = newValue }
+    }
+    private var _themeId: String = "" { didSet { objectWillChange.send() } }
+    var themeId: String {
+        get { _themeId }
+        set { _themeId = newValue }
+    }
+    private var _isDarkMode: Bool = false { didSet { objectWillChange.send() } }
+    var isDarkMode: Bool {
+        get { _isDarkMode }
+        set { _isDarkMode = newValue }
+    }
     // 正在拖拽的任务与把手类型（用于跨行时把手激活色实时跟随新末行/新首行）
-    @Published var draggingTaskID: UUID?
-    @Published var dragKind: String = ""
+    private var _draggingTaskID: UUID? = nil { didSet { objectWillChange.send() } }
+    var draggingTaskID: UUID? {
+        get { _draggingTaskID }
+        set { _draggingTaskID = newValue }
+    }
+    private var _dragKind: String = "" { didSet { objectWillChange.send() } }
+    var dragKind: String {
+        get { _dragKind }
+        set { _dragKind = newValue }
+    }
     // 窗口是否固定到桌面层（桌面 pin：窗口钉在桌面壁纸之上、其他窗口之下）
-    @Published var pinnedToDesktop = false
+    private var _pinnedToDesktop: Bool = false { didSet { objectWillChange.send() } }
+    var pinnedToDesktop: Bool {
+        get { _pinnedToDesktop }
+        set { _pinnedToDesktop = newValue }
+    }
+    // 日历订阅（ICS）服务监听器与订阅地址
+    private var icsListener: NWListener?
+    private var icsPort: UInt16 = 8765
+    private var _icsSubscribeURL: String = "" { didSet { objectWillChange.send() } }
+    var icsSubscribeURL: String {
+        get { _icsSubscribeURL }
+        set { _icsSubscribeURL = newValue }
+    }
+    private var icsContent = ""
 
     private let cal = Calendar.widget
 
     var theme: Theme { Theme.all.first { $0.id == themeId } ?? Theme.all[0] }
     /// 当前生效的调色板（主题 × 明暗）
     var pal: ThemePalette { theme.palette(isDark: isDarkMode) }
+    /// 固定 UserDefaults 域（不能用自己的 bundle id 当 suite 名，否则系统拒绝；直接跑二进制时 CFBundleIdentifier 也可能缺失）
+    private var ud: UserDefaults { UserDefaults(suiteName: "DesktopTaskCalendarPrefs") ?? .standard }
+
 
     init() {
         displayedMonth = cal.startOfMonth(Date())
-        themeId = UserDefaults.standard.string(forKey: "themeId") ?? "mintChocolate"
-        isDarkMode = UserDefaults.standard.bool(forKey: "darkMode")
+        themeId = ud.string(forKey: "themeId") ?? "mintChocolate"
+        isDarkMode = ud.bool(forKey: "darkMode")
         newColorIndex = 0
         load()
         save() // 首次启动即建立数据文件
+        if nativeSyncEnabled { startICSServer(); refreshICS() }
+        dbg("init enabled=\(nativeSyncEnabled) url=\(icsSubscribeURL)")
+    }
+
+    /// 诊断日志：写 caches 目录（沙箱下映射到容器，稳定可读）
+    private func dbg(_ s: String) {
+        let path = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("tc_dbg.log").path
+        let line = "[\(Date())] \(s)\n"
+        if let d = line.data(using: .utf8),
+           let fh = FileHandle(forWritingAtPath: path) {
+            defer { try? fh.close() }
+            try? fh.seekToEnd()
+            try? fh.write(contentsOf: d)
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
     }
 
     func setTheme(_ id: String) {
         themeId = id
-        UserDefaults.standard.set(id, forKey: "themeId")
+        ud.set(id, forKey: "themeId")
     }
 
     func toggleDarkMode() {
         isDarkMode.toggle()
-        UserDefaults.standard.set(isDarkMode, forKey: "darkMode")
+        ud.set(isDarkMode, forKey: "darkMode")
     }
 
     /// 任务条颜色：优先主题标签色板位置，旧任务回退到原 hex
@@ -495,11 +570,11 @@ final class TaskStore: ObservableObject {
     var unscheduled: [TaskItem] { tasks.filter { !$0.isScheduled } }
     var scheduled: [TaskItem] { tasks.filter { $0.isScheduled } }
 
-    /// 渲染用任务列表：未完成的主任务 + 重复规则在视图月内展开的派生实例（单日只读副本）
+    /// 渲染用任务列表：全部排期任务（含已完成的，留痕淡化显示）+ 重复规则在视图月内展开的派生实例
     var visibleScheduled: [TaskItem] {
         var out: [TaskItem] = []
         let gridEnd = day(at: 41)
-        for t in scheduled where t.done != true {
+        for t in scheduled {
             out.append(t)
             guard let rule = t.repeatRule, let s = t.start else { continue }
             var d = cal.addDays(1, to: s)
@@ -507,7 +582,9 @@ final class TaskStore: ObservableObject {
                 if matchesRepeat(rule, origin: s, day: d) {
                     out.append(TaskItem(id: UUID(), title: t.title, colorHex: t.colorHex,
                                         colorIndex: t.colorIndex, start: d, end: d,
-                                        done: false, repeatRule: nil, isDerived: true))
+                                        done: t.done, repeatRule: nil, isDerived: true,
+                                        completedDates: t.completedDates,
+                                        syncToNative: nil, syncReminderID: nil, syncEventID: nil))
                 }
                 d = cal.addDays(1, to: d)
             }
@@ -549,7 +626,150 @@ final class TaskStore: ObservableObject {
         guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
         tasks[i].done = true
         save()
+        syncIfNeeded(for: id)
     }
+
+    /// 重复任务按日期逐个完成（只标记这一天，其余天照常显示）
+    func completeInstance(_ id: UUID, on day: Date) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let ds = iso(day)
+        var set = Set(tasks[i].completedDates ?? [])
+        set.insert(ds)
+        tasks[i].completedDates = Array(set).sorted()
+        save()
+    }
+
+    func iso(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: d)
+    }
+
+    // MARK: 同步到系统日历（ICS 订阅，零权限）
+
+    /// 全局同步总开关（UserDefaults 记忆；未设置过时默认开启，避免用户找不到订阅入口）
+    var nativeSyncEnabled: Bool {
+        get { ud.object(forKey: "nativeSyncEnabled") as? Bool ?? true }
+        set { ud.set(newValue, forKey: "nativeSyncEnabled") }
+    }
+
+    func toggleNativeSyncEnabled() {
+        dbg("toggle called, now=\(nativeSyncEnabled)")
+        nativeSyncEnabled.toggle()
+        if nativeSyncEnabled {
+            bannerDismissed = false   // 重新开启时恢复横幅显示
+            startICSServer()
+            refreshICS()
+        } else {
+            icsContent = ""
+            refreshICS()
+        }
+    }
+
+    /// 订阅横幅是否已被用户隐藏（✕ 后记忆，重新开启同步时恢复）
+    var bannerDismissed: Bool {
+        get { ud.bool(forKey: "syncBannerDismissed") }
+        set { ud.set(newValue, forKey: "syncBannerDismissed") }
+    }
+    func dismissSyncBanner() {
+        bannerDismissed = true
+        objectWillChange.send()
+    }
+
+    func taskSyncOn(_ id: UUID) -> Bool {
+        guard nativeSyncEnabled, let i = tasks.firstIndex(where: { $0.id == id }) else { return false }
+        return tasks[i].syncToNative != false
+    }
+
+    func toggleNativeSync(_ id: UUID) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        // nil（跟随全局）↔ false（显式排除）
+        tasks[i].syncToNative = (tasks[i].syncToNative == false ? nil : false)
+        save()
+        refreshICS()
+    }
+
+    /// 由任务列表生成 iCalendar 内容（全局开关开启时，除显式排除的任务外全部导出；nil 视为跟随全局）
+    func buildICS() -> String {
+        var out = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//DesktopTaskCalendar//CN", "CALSCALE:GREGORIAN"]
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd"
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        stamp.timeZone = TimeZone(identifier: "UTC")
+        let rrules: [String: String] = ["daily": "FREQ=DAILY", "weekly": "FREQ=WEEKLY", "monthly": "FREQ=MONTHLY"]
+        for t in tasks where t.syncToNative != false && t.isScheduled {
+            guard let s = t.start else { continue }
+            let e = t.end ?? s
+            out.append("BEGIN:VEVENT")
+            out.append("UID:task-\(t.id.uuidString)@desktoptaskcalendar")
+            out.append("DTSTAMP:\(stamp.string(from: Date()))")
+            out.append("DTSTART;VALUE=DATE:\(df.string(from: s))")
+            out.append("DTEND;VALUE=DATE:\(df.string(from: cal.addDays(1, to: e)))")
+            if let rule = t.repeatRule, let rr = rrules[rule] { out.append("RRULE:\(rr)") }
+            out.append("SUMMARY:\(icsEscape((t.done == true ? "✓ " : "") + t.title))")
+            let c = t.colorHex
+            if !c.isEmpty { out.append("DESCRIPTION:\(icsEscape("主题色 \(c)"))") }
+            // 提醒：开始日前一天 15:00 系统通知（全天事件按 0:00 锚点，-9h = 前日 15:00）
+            out.append("BEGIN:VALARM")
+            out.append("ACTION:DISPLAY")
+            out.append("DESCRIPTION:任务提醒")
+            out.append("TRIGGER:-PT9H")
+            out.append("END:VALARM")
+            out.append("END:VEVENT")
+        }
+        out.append("END:VCALENDAR")
+        return out.joined(separator: "\r\n")
+    }
+
+    private func icsEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: ";", with: "\\;")
+         .replacingOccurrences(of: ",", with: "\\,")
+         .replacingOccurrences(of: "\n", with: "\\n")
+    }
+
+    /// 刷新内存 ICS 并落盘（供用户手动导入/调试）
+    func refreshICS() {
+        icsContent = nativeSyncEnabled ? buildICS() : ""
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("DesktopTaskCalendar", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? icsContent.data(using: .utf8)?.write(to: dir.appendingPathComponent("desktop-task-calendar.ics"))
+    }
+
+    /// 启动本地 HTTP 服务，向系统日历订阅提供最新 ICS（无需任何系统授权）
+    func startICSServer() {
+        guard icsListener == nil else { return }
+        for port in 8765...8775 {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            guard let l = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: UInt16(port))!) else { continue }
+            l.newConnectionHandler = { [weak self] conn in
+                conn.start(queue: .main)
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, _, _ in
+                    let body = MainActor.assumeIsolated { self?.icsContent ?? "" }
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/calendar; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+                    conn.send(content: Data(resp.utf8), completion: .contentProcessed { _ in conn.cancel() })
+                }
+            }
+            l.start(queue: .main)
+            icsListener = l
+            icsPort = UInt16(port)
+            icsSubscribeURL = "http://127.0.0.1:\(port)/desktop-task-calendar.ics"
+            dbg("ics server on :\(port)")
+            return
+        }
+        dbg("ics server failed to start")
+    }
+
+    /// 兼容旧调用点：同步单任务 → 刷新 ICS
+    func syncIfNeeded(for id: UUID) { refreshICS() }
+    /// 兼容旧调用点：全量同步 → 刷新 ICS
+    func syncAllIfNeeded() { refreshICS() }
+    /// 兼容旧调用点：删除任务后同步 → 刷新 ICS
+    func removeNative(_ t: TaskItem) { refreshICS() }
 
     var gridStart: Date { cal.gridStart(ofMonth: displayedMonth) }
     var monthTitle: String { cal.monthTitle(displayedMonth) }
@@ -613,6 +833,7 @@ final class TaskStore: ObservableObject {
     }
 
     func removeTask(_ id: UUID) {
+        if let t = tasks.first(where: { $0.id == id }) { removeNative(t) }
         tasks.removeAll { $0.id == id }
         save()
     }
@@ -624,6 +845,7 @@ final class TaskStore: ObservableObject {
         tasks[i].start = d
         tasks[i].end = d
         save()
+        syncIfNeeded(for: id)
     }
 
     /// 整体平移
@@ -683,8 +905,11 @@ final class TaskStore: ObservableObject {
 
     func unschedule(_ id: UUID) {
         guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        removeNative(tasks[i])
         tasks[i].start = nil
         tasks[i].end = nil
+        tasks[i].syncReminderID = nil
+        tasks[i].syncEventID = nil
         save()
     }
 
@@ -723,7 +948,16 @@ final class TaskStore: ObservableObject {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("DesktopTaskCalendar", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("tasks.json")
+        // 沙箱化后首次启动：若容器内无数据、旧路径有数据，一次性迁移
+        let target = dir.appendingPathComponent("tasks.json")
+        if !FileManager.default.fileExists(atPath: target.path) {
+            let legacy = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/DesktopTaskCalendar/tasks.json")
+            if FileManager.default.fileExists(atPath: legacy.path) {
+                try? FileManager.default.copyItem(at: legacy, to: target)
+            }
+        }
+        return target
     }
 
     private func load() {
@@ -770,7 +1004,10 @@ struct RowInterval: Identifiable {
 // MARK: - 日历格子
 
 struct DayCell: View {
-    @EnvironmentObject var store: TaskStore
+    private var _store = EnvironmentObject<TaskStore>()
+    var store: TaskStore {
+        get { _store.wrappedValue }
+    }
     let day: Date
     var compact: Bool = false // 窗口较小时缩小日期数字与留白，适配更小尺寸
 
@@ -832,7 +1069,10 @@ func shortDay(_ d: Date) -> String {
 }
 
 struct TaskBar: View {
-    @EnvironmentObject var store: TaskStore
+    private var _store = EnvironmentObject<TaskStore>()
+    var store: TaskStore {
+        get { _store.wrappedValue }
+    }
     let task: TaskItem
     let dayStart: Date
     let cellWidth: CGFloat
@@ -846,10 +1086,27 @@ struct TaskBar: View {
     let rowH: CGFloat      // 网格行高
     let barHeight: CGFloat // 任务条高度（随泳道数动态适配）
 
-    @State private var dragMode: DragMode?
-    @State private var hovered = false
-    @State private var pressOffsetDays: Int?
-    @State private var showingBurst = false   // 完成粒子消散动画进行中
+    // 手写 @State 展开（不依赖宏编译器）
+    private var _dragMode = State(initialValue: nil as DragMode?)
+    var dragMode: DragMode? {
+        get { _dragMode.wrappedValue }
+        nonmutating set { _dragMode.wrappedValue = newValue }
+    }
+    private var _hovered = State(initialValue: false)
+    var hovered: Bool {
+        get { _hovered.wrappedValue }
+        nonmutating set { _hovered.wrappedValue = newValue }
+    }
+    private var _pressOffsetDays = State(initialValue: nil as Int?)
+    var pressOffsetDays: Int? {
+        get { _pressOffsetDays.wrappedValue }
+        nonmutating set { _pressOffsetDays.wrappedValue = newValue }
+    }
+    private var _showingBurst = State(initialValue: false)   // 完成粒子消散动画进行中
+    var showingBurst: Bool {
+        get { _showingBurst.wrappedValue }
+        nonmutating set { _showingBurst.wrappedValue = newValue }
+    }
 
     private let cal = Calendar.widget
 
@@ -872,18 +1129,26 @@ struct TaskBar: View {
         let barCol = weekendOverlap ? baseCol.opacity(pal.isDark ? 0.90 : 0.82) : baseCol
         let handleBase = pal.isDark ? brighter(baseCol, 0.30) : darker(baseCol, 0.15)
         let narrow = width < 34 // 太窄：隐藏文字，只保留把手与色块
-        let showLeftHandle = isFirstRow
-        let showRightHandle = isLastRow
+        // 完成态（留痕淡化）：主任务整体完成，或重复任务该派生日期已逐个完成
+        let completed = task.isDerived == true
+            ? (task.done == true) || (task.completedDates?.contains(store.iso(dayStart)) ?? false)
+            : (task.done == true)
+        let showLeftHandle = isFirstRow && !completed
+        let showRightHandle = isLastRow && !completed
+        let showDoneBtn = isFirstRow && !completed && width >= 48
         // 文字颜色：深色模式统一用主题一级浅色文字（带主题色相，暗底浅字可读且协调）；
         // 浅色模式按亮度适配（优先品牌对比色，对比不足兜底）
         let textColor = pal.isDark ? pal.cTextPrimary : taskTextColor(on: baseCol, pal: pal)
+        // 完成态：主体降透明 + 文字三级灰 + 删除线，保留位置留痕
+        let fillCol = completed ? baseCol.opacity(pal.isDark ? 0.28 : 0.36) : barCol
+        let tColor = completed ? pal.cTextTertiary : textColor
 
         return ZStack(alignment: .topLeading) {
             barShape(pal)
-                .fill(barCol)
+                .fill(fillCol)
                 // 同色系细描边：提升任务条精致度（颜色仍跟随主题）
                 .overlay(barShape(pal)
-                    .strokeBorder(baseCol.opacity(pal.isDark ? 0.45 : 0.35), lineWidth: 1))
+                    .strokeBorder(fillCol.opacity(pal.isDark ? 0.35 : 0.30), lineWidth: 1))
                 .shadow(color: pal.isDark ? pal.cAccent.opacity(pal.glowOpacity)
                                           : Color.black.opacity(0.10),
                         radius: pal.isDark ? 4 : 2, y: 1)
@@ -891,21 +1156,21 @@ struct TaskBar: View {
             // 跨行延续符号：首行右端 / 非首行左端做同色渐隐过渡 + 小圆点
             if spansRows {
                 if !isLastRow {
-                    LinearGradient(colors: [baseCol.opacity(pal.isDark ? 0.55 : 0.65), baseCol.opacity(0)],
+                    LinearGradient(colors: [fillCol.opacity(pal.isDark ? 0.45 : 0.55), fillCol.opacity(0)],
                                    startPoint: .leading, endPoint: .trailing)
                         .frame(width: 16)
                         .offset(x: width - 16, y: 0)
                     Circle()
-                        .fill(pal.isDark ? brighter(baseCol, 0.45) : baseCol)
+                        .fill(completed ? fillCol : (pal.isDark ? brighter(baseCol, 0.45) : baseCol))
                         .frame(width: 4, height: 4)
                         .offset(x: width - 4, y: (barHeight - 4) / 2)
                 }
                 if !isFirstRow {
-                    LinearGradient(colors: [baseCol.opacity(0), baseCol.opacity(pal.isDark ? 0.55 : 0.65)],
+                    LinearGradient(colors: [fillCol.opacity(0), fillCol.opacity(pal.isDark ? 0.45 : 0.55)],
                                    startPoint: .leading, endPoint: .trailing)
                         .frame(width: 16)
                     Circle()
-                        .fill(pal.isDark ? brighter(baseCol, 0.45) : baseCol)
+                        .fill(completed ? fillCol : (pal.isDark ? brighter(baseCol, 0.45) : baseCol))
                         .frame(width: 4, height: 4)
                         .offset(x: 0, y: (barHeight - 4) / 2)
                 }
@@ -917,7 +1182,7 @@ struct TaskBar: View {
                 if isLastRow && !isFirstRow && width >= 64 {
                     Text("\(shortDay(task.start ?? dayStart))–\(shortDay(task.end ?? dayStart))")
                         .font(.system(size: 8.5, weight: .medium, design: .rounded))
-                        .foregroundColor(textColor.opacity(0.88))
+                        .foregroundColor(tColor.opacity(completed ? 0.7 : 0.88))
                         .kerning(0.1)
                         .lineLimit(1)
                         .padding(.leading, 6)
@@ -927,16 +1192,26 @@ struct TaskBar: View {
                     // 字距随条宽延长：宽任务条（跨多天）字距舒展开，封顶 9pt，避免拉爆；
                     // 长名称自动换行（最多 2 行，配合任务条加高），不再用“…”截断
                     let tracking = min(9.0, max(0.0, (width - 90) / 40))
-                    Text(task.title)
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .foregroundColor(textColor)
-                        .kerning(0.3)
-                        .tracking(tracking)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.8)
-                        .truncationMode(.tail)
-                        .padding(.leading, showLeftHandle ? 13 : 6)
-                        .padding(.trailing, showRightHandle ? 13 : 6)
+                    HStack(spacing: 3) {
+                        // 已同步到系统日历的标识（全局开关开启且任务未被排除）
+                        if store.taskSyncOn(task.id) && !completed {
+                            Image(systemName: "calendar.badge.checkmark")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(tColor.opacity(0.72))
+                                .help("已同步到系统日历订阅")
+                        }
+                        Text(task.title)
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundColor(tColor)
+                            .kerning(0.3)
+                            .tracking(tracking)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.8)
+                            .truncationMode(.tail)
+                            .strikethrough(completed, color: tColor.opacity(0.8))
+                    }
+                    .padding(.leading, showLeftHandle ? 13 : 6)
+                    .padding(.trailing, showRightHandle ? 13 : 6)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
             }
@@ -953,29 +1228,35 @@ struct TaskBar: View {
                 linkBlock(base: handleBase, trailing: true)
             }
 
-            // 完成按钮（仅主任务首行显示，避开左右把手）：点击后任务条粒子消散，标记完成
-            if isFirstRow && task.isDerived != true && width >= 48 {
+            // 完成按钮（主任务与重复派生实例首行都显示，避开左右把手）：点击后粒子消散，标记完成
+            if showDoneBtn {
                 ZStack {
-                    Circle().fill(barCol).frame(width: 13, height: 13)
+                    Circle().fill(fillCol).frame(width: 13, height: 13)
                     Image(systemName: "checkmark")
                         .font(.system(size: 7, weight: .bold))
-                        .foregroundColor(textColor)
+                        .foregroundColor(tColor)
                 }
-                .overlay(Circle().strokeBorder(textColor.opacity(0.65), lineWidth: 1.2))
+                .overlay(Circle().strokeBorder(tColor.opacity(0.65), lineWidth: 1.2))
                 .opacity(hovered ? 1 : 0.85)
                 .scaleEffect(hovered ? 1.08 : 1)
                 .contentShape(Circle())
                 .highPriorityGesture(TapGesture().onEnded {
                     withAnimation(.easeOut(duration: 0.15)) { showingBurst = true }
                 })
-                .help("标记完成（粒子消散）")
+                .help(task.isDerived == true ? "标记这一天完成（留痕淡化）" : "标记完成（粒子消散，留痕淡化）")
                 .offset(x: width - 26, y: (barHeight - 13) / 2)
             }
         }
         .overlay {
             if showingBurst {
-                ParticleBurst(color: barCol) { store.complete(task.id) }
-                    .offset(x: width / 2, y: barHeight / 2)
+                ParticleBurst(color: fillCol) {
+                    if task.isDerived == true {
+                        store.completeInstance(task.id, on: dayStart)   // 重复任务按天逐个完成
+                    } else {
+                        store.complete(task.id)                          // 主任务整体完成
+                    }
+                }
+                .offset(x: width / 2, y: barHeight / 2)
             }
         }
         .frame(width: width, height: barHeight)
@@ -985,6 +1266,16 @@ struct TaskBar: View {
             withAnimation(.easeOut(duration: 0.15)) { hovered = h }
         }
         .contextMenu {
+            if task.isDerived != true {
+                // macOS 右键菜单内 Toggle 控件不可靠，用带状态标记的 Button 代替
+                Button {
+                    store.toggleNativeSync(task.id)
+                } label: {
+                    Label(store.taskSyncOn(task.id) ? "取消同步到日历订阅" : "同步到日历订阅",
+                          systemImage: store.taskSyncOn(task.id) ? "checkmark.circle.fill" : "circle")
+                }
+                Divider()
+            }
             Button("移除排期（回到待排列表）") { store.unschedule(task.id) }
             Divider()
             Button("删除任务", role: .destructive) { store.removeTask(task.id) }
@@ -999,7 +1290,11 @@ struct TaskBar: View {
     private struct ParticleBurst: View {
         let color: Color
         let onDone: () -> Void
-        @State private var exploded = false
+        private var _exploded = State(initialValue: false)
+        var exploded: Bool {
+            get { _exploded.wrappedValue }
+            nonmutating set { _exploded.wrappedValue = newValue }
+        }
 
         var body: some View {
             ZStack {
@@ -1106,6 +1401,7 @@ struct TaskBar: View {
                 pressOffsetDays = nil
                 store.draggingTaskID = nil
                 store.dragKind = ""
+                store.syncIfNeeded(for: task.id)   // 拖拽结束后同步改期到原生
             }
     }
 }
@@ -1113,7 +1409,10 @@ struct TaskBar: View {
 // MARK: - 待排任务胶囊
 
 struct TaskChip: View {
-    @EnvironmentObject var store: TaskStore
+    private var _store = EnvironmentObject<TaskStore>()
+    var store: TaskStore {
+        get { _store.wrappedValue }
+    }
     let task: TaskItem
 
     var body: some View {
@@ -1157,7 +1456,10 @@ struct LaneLayout {
 }
 
 struct MonthGrid: View {
-    @EnvironmentObject var store: TaskStore
+    private var _store = EnvironmentObject<TaskStore>()
+    var store: TaskStore {
+        get { _store.wrappedValue }
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -1224,13 +1526,33 @@ struct MonthGrid: View {
 // MARK: - 主界面
 
 struct ContentView: View {
-    @EnvironmentObject var store: TaskStore
-    @State private var showThemeMenu = false
+    private var _store = EnvironmentObject<TaskStore>()
+    var store: TaskStore {
+        get { _store.wrappedValue }
+    }
+    private var _showThemeMenu = State(initialValue: false)
+    var showThemeMenu: Bool {
+        get { _showThemeMenu.wrappedValue }
+        nonmutating set { _showThemeMenu.wrappedValue = newValue }
+    }
+    private var _copied = State(initialValue: false)
+    var copied: Bool {
+        get { _copied.wrappedValue }
+        nonmutating set { _copied.wrappedValue = newValue }
+    }
+    private var _showSubscribeHelp = State(initialValue: false)
+    var showSubscribeHelp: Bool {
+        get { _showSubscribeHelp.wrappedValue }
+        nonmutating set { _showSubscribeHelp.wrappedValue = newValue }
+    }
 
     var body: some View {
-        VStack(spacing: 10) {
-            header
-            inputRow
+        let pal = store.pal
+        return VStack(spacing: 10) {
+            topBar(pal: pal)
+            if store.nativeSyncEnabled && !store.bannerDismissed {
+                subscribeBanner(pal: pal)
+            }
             unscheduledRow
             weekdayHeader
             MonthGrid()
@@ -1238,6 +1560,95 @@ struct ContentView: View {
         .padding(14)
         .background(store.pal.cPageBackground)
         .frame(minWidth: 520, minHeight: 440)
+    }
+
+    /// 顶部统一卡片：工具栏 + 输入行合并，视觉更整体
+    private func topBar(pal: ThemePalette) -> some View {
+        VStack(spacing: 8) {
+            header
+            Rectangle().fill(pal.cBorder.opacity(0.6)).frame(height: 1)
+            inputRow
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: store.theme.cornerRadius, style: .continuous).fill(pal.cCardBackground))
+        .overlay(RoundedRectangle(cornerRadius: store.theme.cornerRadius, style: .continuous).strokeBorder(pal.cBorder, lineWidth: 1))
+        .shadow(color: pal.cShadow, radius: pal.shadowRadius, y: 2)
+    }
+
+    /// 日历订阅横幅（始终显示）：关闭时给开启按钮，开启时给订阅地址 + 复制按钮 + 帮助
+    private func subscribeBanner(pal: ThemePalette) -> some View {
+        let on = store.nativeSyncEnabled
+        let url = store.icsSubscribeURL
+        return HStack(spacing: 10) {
+            Image(systemName: on ? "calendar.badge.plus" : "calendar.badge.exclamationmark")
+                .font(.system(size: 14))
+                .foregroundColor(on ? pal.cAccent : pal.cTextTertiary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(on ? "日历订阅已开启" : "日历订阅未开启")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(pal.cTextPrimary)
+                if on && !url.isEmpty {
+                    Text(url)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(pal.cTextSecondary)
+                        .textSelection(.enabled)
+                } else {
+                    Text("开启后，任务会以日历订阅的方式显示在系统「日历」App 中（零权限、无提醒）")
+                        .font(.system(size: 11))
+                        .foregroundColor(pal.cTextTertiary)
+                }
+            }
+            Spacer()
+            if on {
+                Button(copied ? "已复制 ✓" : "复制订阅地址") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url, forType: .string)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(pal.cAccent)
+                .controlSize(.small)
+                Button("订阅帮助") { showSubscribeHelp = true }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                Button { store.dismissSyncBanner() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundColor(pal.cTextTertiary)
+                }
+                .buttonStyle(.plain)
+                .help("我已订阅完成，隐藏此横幅")
+            } else {
+                Button("开启日历订阅") { store.toggleNativeSyncEnabled() }
+                    .buttonStyle(.borderedProminent)
+                    .tint(pal.cAccent)
+                    .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(pal.cCardBackground.opacity(0.7)))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(pal.cBorder, lineWidth: 1))
+        .popover(isPresented: Binding(get: { showSubscribeHelp }, set: { showSubscribeHelp = $0 }), arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("如何订阅到系统日历").font(.system(size: 13, weight: .semibold))
+                Text("1. 点击「复制订阅地址」").font(.system(size: 12))
+                Text("2. 打开「日历」App").font(.system(size: 12))
+                Text("3. 菜单栏：文件 → 新建日历订阅…").font(.system(size: 12))
+                Text("4. 粘贴地址 → 订阅").font(.system(size: 12))
+                Text("任务条上带小日历✓图标的任务即为已同步；右键任务可单独排除/恢复同步。")
+                    .font(.system(size: 11))
+                    .foregroundColor(pal.cTextTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("任务变化（改期/完成）会自动刷新；系统默认每小时刷新，可右键日历名 → 获取信息 → 改为每 5 分钟。")
+                    .font(.system(size: 11))
+                    .foregroundColor(pal.cTextTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(width: 320)
+        }
     }
 
     private var header: some View {
@@ -1264,6 +1675,12 @@ struct ContentView: View {
                 .background(Capsule().fill(pal.cTextPrimary.opacity(0.05)))
                 .overlay(Capsule().strokeBorder(pal.cTextPrimary.opacity(0.14), lineWidth: 1))
             Spacer()
+            iconButton(icon: store.nativeSyncEnabled ? "arrow.triangle.2.circlepath.circle.fill" : "arrow.triangle.2.circlepath.circle",
+                       help: store.nativeSyncEnabled
+                            ? "日历订阅已开启：订阅地址 \(store.icsSubscribeURL)（打开「日历 App → 文件 → 新建日历订阅…」粘贴此地址；任务变化后日历按刷新频率自动更新，无需授权）"
+                            : "开启日历订阅同步：开启后所有任务（可单独排除）会显示在系统日历中（零权限，无需系统弹窗）") {
+                store.toggleNativeSyncEnabled()
+            }
             iconButton(icon: store.pinnedToDesktop ? "pin.fill" : "pin",
                        help: store.pinnedToDesktop ? "取消固定到桌面" : "固定到桌面（窗口钉在桌面层，壁纸之上、普通窗口之下，跨空间跟随）") {
                 store.toggleDesktopPin()
@@ -1272,11 +1689,8 @@ struct ContentView: View {
                        help: pal.isDark ? "切换浅色模式" : "切换深色模式") { store.toggleDarkMode() }
             themeMenu
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: store.theme.cornerRadius, style: .continuous).fill(pal.cCardBackground))
-        .overlay(RoundedRectangle(cornerRadius: store.theme.cornerRadius, style: .continuous).strokeBorder(pal.cBorder, lineWidth: 1))
-        .shadow(color: pal.cShadow, radius: pal.shadowRadius, y: 2)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
     }
 
     private var themeMenu: some View {
@@ -1293,7 +1707,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .help("切换主题（6 套配色 × 明暗模式）")
-        .popover(isPresented: $showThemeMenu, arrowEdge: .bottom) {
+        .popover(isPresented: Binding(get: { showThemeMenu }, set: { showThemeMenu = $0 }), arrowEdge: .bottom) {
             themePopover
         }
     }
@@ -1360,7 +1774,8 @@ struct ContentView: View {
     private var inputRow: some View {
         let pal = store.pal
         return HStack(spacing: 10) {
-            TextField("输入任务名称，回车或点“添加”", text: $store.newTitle)
+            TextField("输入任务名称，回车或点“添加”",
+                      text: Binding(get: { store.newTitle }, set: { store.newTitle = $0 }))
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .foregroundColor(pal.cTextPrimary)
@@ -1415,10 +1830,8 @@ struct ContentView: View {
                 .shadow(color: pal.isDark ? pal.cAccent.opacity(pal.glowOpacity) : pal.cPrimary.opacity(0.18),
                         radius: pal.isDark ? 6 : 4, y: 1)
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: store.theme.cornerRadius, style: .continuous).fill(pal.cCardBackground))
-        .overlay(RoundedRectangle(cornerRadius: store.theme.cornerRadius, style: .continuous).strokeBorder(pal.cBorder, lineWidth: 1))
-        .shadow(color: pal.cShadow, radius: pal.shadowRadius, y: 2)
+        .padding(.horizontal, 4)
+        .padding(.bottom, 4)
     }
 
     private var unscheduledRow: some View {
@@ -1476,8 +1889,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 @main
 struct DesktopTaskCalendarApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var store = TaskStore()
+    // 手写 @NSApplicationDelegateAdaptor / @StateObject 展开（不依赖宏编译器）
+    private var _appDelegate = NSApplicationDelegateAdaptor<AppDelegate>()
+    var appDelegate: AppDelegate {
+        get { _appDelegate.wrappedValue }
+    }
+    private var _store = StateObject(wrappedValue: TaskStore())
+    var store: TaskStore {
+        get { _store.wrappedValue }
+    }
 
     var body: some Scene {
         WindowGroup {

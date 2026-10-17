@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-111111?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white)](https://developer.apple.com/xcode/swiftui/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/download-v2.0-blue.svg)](#安装)
+[![Release](https://img.shields.io/badge/download-v2.2-blue.svg)](#安装)
 
 </div>
 
@@ -24,6 +24,8 @@
 
 - 🔒 **纯本地** —— 数据只落在你自己的 `~/Library/...`，不上传、不同步、无遥测
 - 🖱️ **拖拽优先** —— 拖中间平移、拖左右边缘改起止日，按天自动吸附
+- 📅 **同步到系统日历（ICS 订阅）** —— 一键开启后，任务以日历订阅方式显示在原生「日历」App 中，**零系统权限、零弹窗、零云端**，任务自带系统提醒（开始前一天 15:00 通知）
+- ✨ **同步状态一目了然** —— 已同步的任务条上带小日历✓标识，无需自己对比筛查；右键任务可单独排除/恢复同步
 - 🎨 **6 套完整主题 × 浅/深模式** —— 低饱和、莫兰迪调，深色模式单独设计而非反色
 - ⚡ **原生 SwiftUI** —— 标准 macOS 窗口、红绿灯按钮、Launchpad 图标，系统级手感
 
@@ -50,6 +52,8 @@
 | 顶栏画笔图标 | 切换 6 套主题 |
 | 顶栏月亮 / 太阳 | 切换浅 / 深色模式 |
 | 左上角 | 上 / 下月、「回到今天」 |
+| 订阅横幅 ✕ | 隐藏订阅提示（重新开启同步时恢复显示） |
+| 任务条上的小日历✓ | 该任务已同步到系统日历订阅 |
 
 跨周任务自动跨行显示（跨行同色连续、行尾渐隐延续、**每一行都显示任务名称**、末行显示时间范围）；同一日期可排多个任务，重叠/交叉自动分泳道堆叠；长名称自动换行（任务条随标题行数自适应加高），不再用省略号截断；左右两端有同色系拖拽把手，悬停/拖动高亮放大；拖动实时跟随鼠标所在日期，一次可连续跨多行。
 
@@ -70,7 +74,7 @@
 
 ### 方式一：下载安装包（推荐）
 
-从仓库下载 [`桌面任务日历-v2.0.zip`](桌面任务日历-v2.0.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
+从仓库下载 [`TaskCalendar-v2.2.zip`](TaskCalendar-v2.2.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
 
 > **首次打开提示"无法验证开发者"？**
 > 前往「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行：
@@ -78,15 +82,20 @@
 > xattr -dr com.apple.quarantine /Applications/TaskCalendar.app
 > ```
 
-### 方式二：从源码构建
+### 方式二：从源码构建（无需 Xcode）
 
-需要 **macOS 13+** 与 **Xcode Command Line Tools**：
+需要 **macOS 13+** 与 **Xcode Command Line Tools**（`xcode-select --install` 即可，无需完整 Xcode）。
+源码已将全部 SwiftUI 宏（`@Published` / `@State` / `@EnvironmentObject` / `@StateObject` 等）手工展开，可直接用 CLT 的 `swiftc` 编译：
 
 ```bash
 cd TaskCalendar
-swift build -c release
-# 把编译产物塞进预建的 .app 包结构
-cp .build/release/TaskCalendar ../TaskCalendar.app/Contents/MacOS/TaskCalendar
+/Library/Developer/CommandLineTools/usr/bin/swiftc \
+  -parse-as-library -O -o /tmp/TaskCalendar \
+  -sdk /Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk \
+  -target arm64-apple-macos14.0 \
+  -framework SwiftUI -framework AppKit -framework CoreGraphics -framework Network \
+  Sources/TaskCalendar.swift
+cp /tmp/TaskCalendar ../TaskCalendar.app/Contents/MacOS/TaskCalendar
 codesign --force --deep -s - ../TaskCalendar.app
 open ../TaskCalendar.app
 ```
@@ -94,13 +103,12 @@ open ../TaskCalendar.app
 ## 🗂️ 仓库结构
 
 ```
-├── TaskCalendar/               # SwiftPM 源码
-│   ├── Package.swift           # macOS 13+ 清单
-│   ├── Sources/TaskCalendar.swift   # 数据层 / 拖拽月历 / 多主题 UI
+├── TaskCalendar/               # 单文件源码
+│   ├── Sources/TaskCalendar.swift   # 数据层 / 拖拽月历 / 多主题 UI / ICS 订阅（宏已展开，CLT 可直接编译）
 │   ├── Info.plist
 │   └── make_icon.swift         # 图标生成脚本
 ├── TaskCalendar.app/           # 预构建好的 App（可直接运行）
-├── 桌面任务日历-v2.0.zip       # 分发包
+├── TaskCalendar-v2.2.zip       # 分发包
 ├── icon.png                    # 应用图标
 └── README.md
 ```
@@ -124,6 +132,12 @@ open ../TaskCalendar.app
 <details>
 <summary>展开全部版本历史</summary>
 
+- **v2.2**（2026-10-17）：
+  - **同步到系统日历订阅（ICS）**：零权限、零弹窗、零云端——本地 HTTP 服务提供订阅地址，一键开启后任务以日历订阅方式显示在原生「日历」App（`http://127.0.0.1:8765/desktop-task-calendar.ics`）
+  - 订阅任务自带**系统提醒（VALARM）**：任务开始前一天 15:00 通知
+  - **同步标识**：已同步任务条上带小日历✓图标，一眼可辨；右键任务可单独排除/恢复同步（全局开关也保留）
+  - 顶栏重构：工具栏 + 输入行合并为统一卡片；订阅横幅支持 ✕ 一键隐藏（重新开启同步时恢复显示）
+  - **无需 Xcode 编译**：SwiftUI 宏全部手工展开，Xcode Command Line Tools 的 `swiftc` 直接编译
 - **v2.1**（2026-10-08）：任务完成按钮 + 粒子消散（点击任务条右上角对勾，48 颗粒子爆发 + 冲击波圆环 + 中心闪光，0.7 秒后任务从日历消失，数据保留）；任务重复执行（输入行重复按钮循环切换 不重复 / 每天 / 每周 / 每月，重复任务在视图月内自动展开为单日实例，主任务跨行显示不受影响，展开实例只读不可拖拽；完成后主任务与未来展开一起隐藏；旧数据无缝兼容）。
 - **v2.0**（2026-09-30）：支持同一日期排多个任务（重叠/交叉自动泳道堆叠，任务条高度随泳道数与标题换行自适应）；窗口可缩放到更小尺寸（最小 520×440）且全 UI 自适应；任务条文字垂直居中、字距随跨度适度延长；跨行任务每行都显示名称、末行保留时间；长名称自动换行不再省略号截断；单格任务正常显示名称；任务条配色重构（浅色模式用主题品牌对比色、深色模式压暗彩块+主题浅色文字，新增同色系细描边）；任务颜色选择不再自动跳转；顶栏新增「固定到桌面」+ 菜单栏 ⌘P 切换（保持可交互，跨桌面空间跟随）。
 - **v1.9**（2026-09-30）：跨行任务连续显示（分段圆角 / 渐隐延续 / 周末降透明）+ 同色系拖拽把手（40%→100% 悬停放大、激活切强调色）+ 绝对位置实时拖拽（任务条跟随鼠标，斜向跨行不断线）。
