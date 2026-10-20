@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-111111?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white)](https://developer.apple.com/xcode/swiftui/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/download-v2.2-blue.svg)](#安装)
+[![Release](https://img.shields.io/badge/download-v2.2.1-blue.svg)](#安装)
 
 </div>
 
@@ -47,7 +47,9 @@
 | 拖任务条**右边缘** | 延长 / 缩短结束日 |
 | 拖任务条**左边缘** | 调整开始日 |
 | 右键任务条 | 移除排期（回待办）/ 删除任务 |
-| 任务条右上角对勾 | 标记完成，任务粒子消散后从日历消失 |
+| 任务条右上角对勾 | 标记完成，任务粒子消散后留痕淡化 |
+| 已完成任务条的回退箭头 | 误触完成时一键取消（恢复完成状态） |
+| 重复任务每日实例条对勾 | 逐日标记完成（每个重复日可单独完成/取消，含第一个任务） |
 | 输入行重复按钮 | 循环切换：不重复 → 每天 → 每周 → 每月 |
 | 顶栏画笔图标 | 切换 6 套主题 |
 | 顶栏月亮 / 太阳 | 切换浅 / 深色模式 |
@@ -74,7 +76,7 @@
 
 ### 方式一：下载安装包（推荐）
 
-从仓库下载 [`TaskCalendar-v2.2.zip`](TaskCalendar-v2.2.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
+从仓库下载 [`TaskCalendar-v2.2.1.zip`](TaskCalendar-v2.2.1.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
 
 > **首次打开提示"无法验证开发者"？**
 > 前往「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行：
@@ -108,7 +110,7 @@ open ../TaskCalendar.app
 │   ├── Info.plist
 │   └── make_icon.swift         # 图标生成脚本
 ├── TaskCalendar.app/           # 预构建好的 App（可直接运行）
-├── TaskCalendar-v2.2.zip       # 分发包
+├── TaskCalendar-v2.2.1.zip     # 分发包
 ├── icon.png                    # 应用图标
 └── README.md
 ```
@@ -132,6 +134,11 @@ open ../TaskCalendar.app
 <details>
 <summary>展开全部版本历史</summary>
 
+- **v2.2.1**（2026-10-20）：
+  - **重复任务逐日完成修复**：重复任务的每一天（含第一个任务）都有独立实例条，可逐个标记完成/取消（此前派生实例用临时 UUID 导致完成操作静默失败，现已通过 sourceID 定位真实主任务）
+  - **误触完成可取消**：已完成任务条显示回退箭头按钮，点击一键恢复；右键菜单新增「取消完成」
+  - 重复任务主条不再显示完成按钮（避免误触整体完成），右键「标记完成」仍可整体完成
+  - 右键删除/移除派生实例时正确作用于主任务
 - **v2.2**（2026-10-17）：
   - **同步到系统日历订阅（ICS）**：零权限、零弹窗、零云端——本地 HTTP 服务提供订阅地址，一键开启后任务以日历订阅方式显示在原生「日历」App（`http://127.0.0.1:8765/desktop-task-calendar.ics`）
   - 订阅任务自带**系统提醒（VALARM）**：任务开始前一天 15:00 通知

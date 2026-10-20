@@ -72,6 +72,7 @@ struct TaskItem: Identifiable, Codable, Equatable {
     var done: Bool? = nil          // 主任务整体完成（渲染为留痕淡化）
     var repeatRule: String? = nil  // 重复规则：nil / "daily" / "weekly" / "monthly"
     var isDerived: Bool? = nil     // 重复任务展开出的派生实例（只读，不可拖拽/完成）
+    var sourceID: UUID? = nil      // 派生实例指向的主任务 id（完成/取消完成时定位真实任务）
     var completedDates: [String]? = nil  // 重复任务按日期逐个完成的记录（ISO8601 日期字符串）
     var syncToNative: Bool? = nil        // 单任务同步开关（同步到原生日历/提醒）
     var syncReminderID: String? = nil    // 已同步的提醒事项 ID（幂等更新用）
@@ -577,12 +578,15 @@ final class TaskStore: ObservableObject {
         for t in scheduled {
             out.append(t)
             guard let rule = t.repeatRule, let s = t.start else { continue }
-            var d = cal.addDays(1, to: s)
+            // 展开从任务开始日当天起（含第一个任务，保证每天都能单独完成/取消），且不早于视图首日
+            let gridStart = day(at: 0)
+            var d = s < gridStart ? gridStart : s
             while d <= gridEnd {
                 if matchesRepeat(rule, origin: s, day: d) {
                     out.append(TaskItem(id: UUID(), title: t.title, colorHex: t.colorHex,
                                         colorIndex: t.colorIndex, start: d, end: d,
                                         done: t.done, repeatRule: nil, isDerived: true,
+                                        sourceID: t.id,
                                         completedDates: t.completedDates,
                                         syncToNative: nil, syncReminderID: nil, syncEventID: nil))
                 }
@@ -636,6 +640,24 @@ final class TaskStore: ObservableObject {
         var set = Set(tasks[i].completedDates ?? [])
         set.insert(ds)
         tasks[i].completedDates = Array(set).sorted()
+        save()
+    }
+
+    /// 取消整体完成（误触恢复）
+    func uncomplete(_ id: UUID) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        tasks[i].done = false
+        save()
+        syncIfNeeded(for: id)
+    }
+
+    /// 取消某一天的完成（重复任务留痕恢复）
+    func uncompleteInstance(_ id: UUID, on day: Date) {
+        guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let ds = iso(day)
+        var set = Set(tasks[i].completedDates ?? [])
+        set.remove(ds)
+        tasks[i].completedDates = set.isEmpty ? nil : Array(set).sorted()
         save()
     }
 
@@ -1135,7 +1157,10 @@ struct TaskBar: View {
             : (task.done == true)
         let showLeftHandle = isFirstRow && !completed
         let showRightHandle = isLastRow && !completed
-        let showDoneBtn = isFirstRow && !completed && width >= 48
+        // 重复任务的主条不显示完成按钮：避免误触整体完成，只能逐日点实例完成
+        let isRepeatMaster = task.repeatRule != nil && task.isDerived != true
+        // 未完成显示对勾（完成）；已完成显示回退箭头（误触可一键恢复）
+        let showDoneBtn = isFirstRow && width >= 48 && !isRepeatMaster
         // 文字颜色：深色模式统一用主题一级浅色文字（带主题色相，暗底浅字可读且协调）；
         // 浅色模式按亮度适配（优先品牌对比色，对比不足兜底）
         let textColor = pal.isDark ? pal.cTextPrimary : taskTextColor(on: baseCol, pal: pal)
@@ -1228,32 +1253,46 @@ struct TaskBar: View {
                 linkBlock(base: handleBase, trailing: true)
             }
 
-            // 完成按钮（主任务与重复派生实例首行都显示，避开左右把手）：点击后粒子消散，标记完成
+            // 完成/恢复按钮（主任务与重复派生实例首行都显示，避开左右把手）：
+            // 未完成点击粒子消散标记完成；已完成点击直接恢复（误触可取消）
             if showDoneBtn {
                 ZStack {
                     Circle().fill(fillCol).frame(width: 13, height: 13)
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 7, weight: .bold))
+                    Image(systemName: completed ? "arrow.uturn.backward" : "checkmark")
+                        .font(.system(size: completed ? 7.5 : 7, weight: .bold))
                         .foregroundColor(tColor)
                 }
                 .overlay(Circle().strokeBorder(tColor.opacity(0.65), lineWidth: 1.2))
-                .opacity(hovered ? 1 : 0.85)
+                .opacity(hovered ? 1 : (completed ? 0.6 : 0.85))
                 .scaleEffect(hovered ? 1.08 : 1)
                 .contentShape(Circle())
                 .highPriorityGesture(TapGesture().onEnded {
-                    withAnimation(.easeOut(duration: 0.15)) { showingBurst = true }
+                    // 派生实例的 id 是临时 UUID，用 sourceID 定位真实主任务
+                    let realID = task.sourceID ?? task.id
+                    if completed {
+                        // 已完成的条：点击恢复（取消完成）
+                        if task.isDerived == true {
+                            store.uncompleteInstance(realID, on: dayStart)
+                        } else {
+                            store.uncomplete(realID)
+                        }
+                    } else {
+                        withAnimation(.easeOut(duration: 0.15)) { showingBurst = true }
+                    }
                 })
-                .help(task.isDerived == true ? "标记这一天完成（留痕淡化）" : "标记完成（粒子消散，留痕淡化）")
+                .help(completed ? "取消完成（恢复这一天）"
+                                : (task.isDerived == true ? "标记这一天完成（留痕淡化）" : "标记完成（粒子消散，留痕淡化）"))
                 .offset(x: width - 26, y: (barHeight - 13) / 2)
             }
         }
         .overlay {
             if showingBurst {
                 ParticleBurst(color: fillCol) {
+                    let realID = task.sourceID ?? task.id
                     if task.isDerived == true {
-                        store.completeInstance(task.id, on: dayStart)   // 重复任务按天逐个完成
+                        store.completeInstance(realID, on: dayStart)   // 重复任务按天逐个完成
                     } else {
-                        store.complete(task.id)                          // 主任务整体完成
+                        store.complete(realID)                          // 主任务整体完成
                     }
                 }
                 .offset(x: width / 2, y: barHeight / 2)
@@ -1276,9 +1315,26 @@ struct TaskBar: View {
                 }
                 Divider()
             }
-            Button("移除排期（回到待排列表）") { store.unschedule(task.id) }
+            Button(completed ? "取消完成" : "标记完成") {
+                let realID = task.sourceID ?? task.id
+                if completed {
+                    if task.isDerived == true {
+                        store.uncompleteInstance(realID, on: dayStart)
+                    } else {
+                        store.uncomplete(realID)
+                    }
+                } else {
+                    if task.isDerived == true {
+                        store.completeInstance(realID, on: dayStart)
+                    } else {
+                        store.complete(realID)
+                    }
+                }
+            }
             Divider()
-            Button("删除任务", role: .destructive) { store.removeTask(task.id) }
+            Button("移除排期（回到待排列表）") { store.unschedule(task.sourceID ?? task.id) }
+            Divider()
+            Button("删除任务", role: .destructive) { store.removeTask(task.sourceID ?? task.id) }
         }
         .onDrop(of: [.plainText],
                 delegate: BarDropDelegate(store: store, id: task.id,
