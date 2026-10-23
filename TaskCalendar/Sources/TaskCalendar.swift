@@ -1929,46 +1929,107 @@ struct ContentView: View {
 
 // MARK: - App
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    // 由 AppDelegate 持有数据与窗口：窗口关闭（叉掉）后对象仍保留，点 Dock 图标可原样唤回
+    let store = TaskStore()
+    private var window: NSWindow?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 标准 macOS 应用：正常窗口、Dock 图标，窗口位置记忆
-        let apply: () -> Void = {
-            if let w = NSApp.windows.first {
-                w.title = "桌面任务日历"
-                w.setFrameAutosaveName("DesktopTaskCalendarMain")
+        buildMenu()
+        makeWindow()
+    }
+
+    func makeWindow() {
+        // 已有窗口（哪怕已关闭）→ 直接唤回，不重建（数据与位置都在）
+        if let w = window, w.contentViewController != nil {
+            w.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let hosting = NSHostingController(rootView: ContentView().environmentObject(store))
+        let w = NSWindow(contentViewController: hosting)
+        w.title = "桌面任务日历"
+        w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        w.setContentSize(NSSize(width: 980, height: 640))
+        w.isReleasedWhenClosed = false   // 叉掉窗口不释放对象，便于重新唤回
+        w.isRestorable = false           // 禁用系统窗口恢复：避免 reopen 时系统自动重建一个“重复窗口”
+        // 位置记忆（手动）：移动/缩放时保存，下次启动/唤回时恢复
+        if let saved = UserDefaults.standard.string(forKey: "DesktopTaskCalendarFrame") {
+            let r = NSRectFromString(saved)
+            if r.width > 200 && r.height > 200 { w.setFrame(r, display: true) }
+        } else {
+            w.center()
+        }
+        w.makeKeyAndOrderFront(nil)
+        window = w
+        let win = w
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: win,
+                                               queue: .main) { n in
+            if let obj = n.object as? NSWindow {
+                UserDefaults.standard.set(NSStringFromRect(obj.frame), forKey: "DesktopTaskCalendarFrame")
             }
         }
-        apply()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { apply() }
+        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: win,
+                                               queue: .main) { n in
+            if let obj = n.object as? NSWindow {
+                UserDefaults.standard.set(NSStringFromRect(obj.frame), forKey: "DesktopTaskCalendarFrame")
+            }
+        }
+    }
+
+    // 叉掉窗口后（进程常驻，ICS 订阅服务不断）再点 Dock 图标 → 重新唤回窗口
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { makeWindow() }
+        return true
+    }
+
+    // 菜单栏「窗口」：固定/取消固定到桌面（Cmd+P）
+    @objc func togglePinFromMenu(_ sender: AnyObject) {
+        store.toggleDesktopPin()
+    }
+
+    /// 构建主菜单栏：App 菜单 + 窗口菜单（不用 SwiftUI Scene，杜绝任何多余窗口）
+    func buildMenu() {
+        let mainMenu = NSMenu()
+
+        // App 菜单：关于 / 退出
+        let appItem = NSMenuItem()
+        mainMenu.addItem(appItem)
+        let appMenu = NSMenu()
+        appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "关于桌面任务日历",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出桌面任务日历",
+                        action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+
+        // 窗口菜单：固定到桌面（Cmd+P）
+        let windowItem = NSMenuItem()
+        mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "窗口")
+        windowItem.submenu = windowMenu
+        let pinItem = windowMenu.addItem(withTitle: "固定到桌面",
+                                         action: #selector(AppDelegate.togglePinFromMenu(_:)),
+                                         keyEquivalent: "p")
+        pinItem.target = self
+
+        NSApp.mainMenu = mainMenu
     }
 }
 
-@main
-struct DesktopTaskCalendarApp: App {
-    // 手写 @NSApplicationDelegateAdaptor / @StateObject 展开（不依赖宏编译器）
-    private var _appDelegate = NSApplicationDelegateAdaptor<AppDelegate>()
-    var appDelegate: AppDelegate {
-        get { _appDelegate.wrappedValue }
-    }
-    private var _store = StateObject(wrappedValue: TaskStore())
-    var store: TaskStore {
-        get { _store.wrappedValue }
-    }
+// MARK: - 纯 AppKit 入口（无 SwiftUI Scene：窗口/菜单完全由 AppDelegate 控制，杜绝多余窗口）
 
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .environmentObject(store)
-        }
-        .defaultSize(width: 980, height: 640)
-        .commands {
-            // 菜单栏命令：固定/取消固定到桌面（Cmd+P）——即使顶栏按钮被其他窗口遮挡，也能从菜单栏随时切换
-            CommandMenu("窗口") {
-                Button(store.pinnedToDesktop ? "取消固定到桌面" : "固定到桌面") {
-                    store.toggleDesktopPin()
-                }
-                .keyboardShortcut("p", modifiers: .command)
-            }
-        }
+@main
+struct AppMain {
+    @MainActor
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.regular)
+        app.run()
     }
 }

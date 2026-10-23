@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-111111?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Swift](https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white)](https://developer.apple.com/xcode/swiftui/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/download-v2.2.1-blue.svg)](#安装)
+[![Release](https://img.shields.io/badge/download-v2.2.2-blue.svg)](#安装)
 
 </div>
 
@@ -76,7 +76,7 @@
 
 ### 方式一：下载安装包（推荐）
 
-从仓库下载 [`TaskCalendar-v2.2.1.zip`](TaskCalendar-v2.2.1.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
+从仓库下载 [`TaskCalendar-v2.2.2.zip`](TaskCalendar-v2.2.2.zip)，解压后把 `TaskCalendar.app` 拖入 `/Applications` 即可。
 
 > **首次打开提示"无法验证开发者"？**
 > 前往「系统设置 → 隐私与安全性」点击「仍要打开」，或在终端执行：
@@ -110,7 +110,7 @@ open ../TaskCalendar.app
 │   ├── Info.plist
 │   └── make_icon.swift         # 图标生成脚本
 ├── TaskCalendar.app/           # 预构建好的 App（可直接运行）
-├── TaskCalendar-v2.2.1.zip     # 分发包
+├── TaskCalendar-v2.2.2.zip     # 分发包
 ├── icon.png                    # 应用图标
 └── README.md
 ```
@@ -134,6 +134,11 @@ open ../TaskCalendar.app
 <details>
 <summary>展开全部版本历史</summary>
 
+- **v2.2.2**（2026-10-24）：
+  - **窗口重新打开修复（架构重构）**：App 改为纯 AppKit 入口，窗口完全由 AppDelegate 托管——叉掉窗口后点 Dock 图标原样唤回，不再需要手动退出后台；彻底移除 SwiftUI Scene（修复此前出现的重复窗口 / Settings 多余窗口问题）
+  - 禁用系统窗口恢复（`isRestorable=false`），窗口位置改为手动记忆（移动/缩放自动保存，重启恢复）
+  - 菜单栏改为原生构建：「桌面任务日历」菜单（关于 / 退出 ⌘Q）+「窗口」菜单（固定到桌面 ⌘P）
+  - App 进程保持常驻，ICS 日历订阅服务不断
 - **v2.2.1**（2026-10-20）：
   - **重复任务逐日完成修复**：重复任务的每一天（含第一个任务）都有独立实例条，可逐个标记完成/取消（此前派生实例用临时 UUID 导致完成操作静默失败，现已通过 sourceID 定位真实主任务）
   - **误触完成可取消**：已完成任务条显示回退箭头按钮，点击一键恢复；右键菜单新增「取消完成」
